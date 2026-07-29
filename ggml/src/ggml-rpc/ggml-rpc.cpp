@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "ggml-trace.h"
 #include "transport.h"
 
 #include <array>
@@ -225,6 +226,8 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+    std::string endpoint;
+    uint32_t device;
 };
 
 // RPC helper functions
@@ -473,6 +476,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
+        ggml_trace_rpc(ctx->endpoint.c_str(), (int) ctx->device,
+            response.result ? "SET_TENSOR_HASH (hit)" : "SET_TENSOR_HASH (miss)",
+            tensor->name, tensor->ne, sizeof(request), sizeof(response));
         if (response.result) {
             // the server has the same data, no need to send it
             return;
@@ -486,6 +492,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
     RPC_STATUS_ASSERT(status);
+    ggml_trace_rpc(ctx->endpoint.c_str(), (int) ctx->device, "SET_TENSOR", tensor->name, tensor->ne, input_size, 0);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -496,6 +503,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     request.size = size;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
     RPC_STATUS_ASSERT(status);
+    ggml_trace_rpc(ctx->endpoint.c_str(), (int) ctx->device, "GET_TENSOR", tensor->name, tensor->ne, sizeof(request), size);
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -515,6 +523,8 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         rpc_msg_copy_tensor_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
+        ggml_trace_rpc(ctx->endpoint.c_str(), (int) ctx->device, "COPY_TENSOR", src->name, src->ne,
+            sizeof(request), sizeof(response));
         return response.result;
     }
     return false;
@@ -556,7 +566,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, buft_ctx->endpoint, buft_ctx->device},
             response.remote_size);
         return buffer;
     } else {
@@ -702,6 +712,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    const int64_t graph_ne[GGML_MAX_DIMS] = { cgraph->n_nodes, 1, 1, 1 };
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
         rpc_msg_graph_recompute_req request;
@@ -709,6 +720,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
+        ggml_trace_rpc(rpc_ctx->endpoint.c_str(), (int) rpc_ctx->device, "GRAPH_RECOMPUTE",
+            cgraph->nodes[cgraph->n_nodes - 1]->name, graph_ne, sizeof(request), 0);
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
@@ -716,6 +729,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         RPC_STATUS_ASSERT(status);
+        ggml_trace_rpc(rpc_ctx->endpoint.c_str(), (int) rpc_ctx->device, "GRAPH_COMPUTE",
+            cgraph->nodes[cgraph->n_nodes - 1]->name, graph_ne, input.size(), 0);
     }
     return GGML_STATUS_SUCCESS;
 }

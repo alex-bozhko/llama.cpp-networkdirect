@@ -5,6 +5,7 @@
 #include "base64.hpp"
 #include "log.h"
 #include "console.h"
+#include "ggml-trace.h"
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
@@ -517,6 +518,7 @@ int cli_context::run() {
 
         // process commands
         if (string_starts_with(buffer, "/exit")) {
+            ggml_trace_write_html_default();
             break;
         } else if (string_starts_with(buffer, "/regen")) {
             if (impl->messages.size() >= 2) {

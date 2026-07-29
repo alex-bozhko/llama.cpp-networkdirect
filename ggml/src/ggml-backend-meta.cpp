@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-trace.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2103,7 +2104,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
-        auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
+        auto push_data = [&](const char * phase, const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
@@ -2115,6 +2116,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_tmp = get_node_aux(node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
+
+            ggml_trace_transfer(phase, ggml_backend_name(bcj_src.backend), ggml_backend_name(bcj_dst.backend),
+                node_src->name, node_src->ne, ggml_nbytes(node_src));
 
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
 
@@ -2143,7 +2147,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
         for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
             const size_t j_dst = j_src - 2*offset_j_max;
-            push_data(j_src, j_dst, i_buf);
+            push_data("fold", j_src, j_dst, i_buf);
             const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
@@ -2160,7 +2164,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (j_other >= n_backends) {
                     continue;
                 }
-                push_data(j, j_other, i_buf);
+                push_data("exchange", j, j_other, i_buf);
             }
 
             for (size_t j = 0; j < 2*offset_j_max; j++) {
@@ -2184,6 +2188,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_trace_transfer("copy-back", ggml_backend_name(bcj_src.backend), ggml_backend_name(bcj_dst.backend),
+                node_src->name, node_src->ne, ggml_nbytes(node_src));
             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
         }
 
@@ -2201,6 +2207,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            ggml_tensor * node_ar = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+            const int trace_id = ggml_trace_allreduce_begin((int) i, (int) n_backends, node_ar->name,
+                ggml_type_name(node_ar->type), node_ar->ne, ggml_nbytes(node_ar));
+
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2219,6 +2229,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+
+            ggml_trace_allreduce_end(trace_id, backend_allreduce_success ? "native" : "butterfly");
         }
     }
     return GGML_STATUS_SUCCESS;
