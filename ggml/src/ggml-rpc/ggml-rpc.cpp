@@ -1750,6 +1750,8 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 
 #ifdef GGML_RPC_RDMA
     printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+#elif defined(GGML_RPC_ND)
+    printf("  transport      : TCP (NetworkDirect auto-negotiate enabled)\n");
 #else
     printf("  transport      : TCP\n");
 #endif // GGML_RPC_RDMA

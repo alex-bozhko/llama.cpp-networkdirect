@@ -30,6 +30,9 @@ param(
 
     [string] $OneApiSetvars,
 
+    # NetworkDirect SDK for the RDMA transport; ND is added to the host build when present
+    [string] $NdSdk = 'C:/repo/local/NetworkDirect',
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $CMakeArgs = @()
 )
@@ -186,6 +189,15 @@ $hostDir = "$BuildDir-host"
 $syclDir = "$BuildDir-sycl"
 $dist    = "$BuildDir-dist"
 
+# the RPC backend is part of the host build, so NetworkDirect is an MSVC concern only
+$ndArgs = @()
+if ($NdSdk -and (Test-Path $NdSdk)) {
+    Write-Host "NetworkDirect SDK: $NdSdk" -ForegroundColor Cyan
+    $ndArgs = @('-DGGML_RPC_ND=ON', "-DGGML_RPC_ND_SDK=$NdSdk")
+} else {
+    Write-Host "NetworkDirect SDK not found, RPC will be TCP only" -ForegroundColor Yellow
+}
+
 Invoke-CMake -Dir $hostDir -Arguments (@(
     '-G', 'Ninja'
     '-DCMAKE_BUILD_TYPE=Release'
@@ -197,7 +209,7 @@ Invoke-CMake -Dir $hostDir -Arguments (@(
     '-DGGML_BACKEND_DL=ON'
     '-DGGML_CPU_ALL_VARIANTS=ON'
     '-DGGML_RPC=ON'
-) + $vcpkgArgs + $CMakeArgs)
+) + $ndArgs + $vcpkgArgs + $CMakeArgs)
 
 Invoke-CMake -Dir $syclDir -Target 'ggml-sycl' -Arguments (@(
     '-G', 'Ninja'

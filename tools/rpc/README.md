@@ -101,6 +101,22 @@ On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC back
 
 RDMA is enabled by default when `libibverbs` is found at build time.
 
+### NetworkDirect transport
+
+On Windows, the equivalent role is served by NetworkDirect. It is off by default and needs a NetworkDirect SDK checkout providing `src/ndutil` plus a generated `ndstatus.h`:
+
+```bash
+$ cmake -B build -DGGML_RPC=ON -DGGML_RPC_ND=ON -DGGML_RPC_ND_SDK=C:/path/to/NetworkDirect
+```
+
+Like RDMA, the transport is negotiated during the HELLO handshake and needs no command-line changes. If no NetworkDirect provider is installed, or the adapter cannot be opened, both peers silently stay on TCP.
+
+The TCP connection is also used to pick the local adapter. When RDMA and TCP run over different NICs, set `GGML_ND_ADDR` on both peers to the IPv4 address of the RDMA NIC.
+
+Note that the reference provider uses a fixed connection-management port, so only one NetworkDirect-enabled `ggml-rpc-server` can serve a client per host at a time. Further servers detect that the port is taken and fall back to TCP.
+
+Set `GGML_RPC_DEBUG=1` on both peers to trace the NetworkDirect bring-up: adapter selection and capabilities, memory registration, completion queue and queue pair creation, and each stage of the connection handshake. Every step that can decline to TCP reports why.
+
 ### Troubleshooting
 
 Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggml-rpc-server`:

@@ -29,6 +29,15 @@
 #  endif
 #endif // GGML_RPC_RDMA
 
+#ifdef GGML_RPC_ND
+#  include <ws2tcpip.h>
+#  include <ndsupport.h>
+#  include <chrono>
+#  include <deque>
+#  include <future>
+#  include <vector>
+#endif // GGML_RPC_ND
+
 #ifdef _WIN32
 typedef SOCKET sockfd_t;
 using ssize_t = __int64;
@@ -113,16 +122,208 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 
 #endif // GGML_RPC_RDMA
 
+#ifdef GGML_RPC_ND
+
+// NetworkDirect (Windows RDMA) transport.
+//
+// Same shape as the libibverbs path: the TCP connection is established first and carries
+// HELLO, the ND connection is negotiated out of band through conn_caps, and any failure
+// silently leaves the socket on TCP.
+//
+// The provider implements only a subset of ND SPI v2 - no RDMA Read, no shared receive
+// queues, no usable memory windows, no inline sends, and only the first SGE of a request
+// is honoured - so everything below stays inside that subset.
+//
+// Flow control: ND does not retry when the peer has no receive posted, so the sender may
+// never have more than ND_WINDOW chunks outstanding. After ND_WINDOW chunks it blocks for
+// an ack, which the receiver emits once it has consumed and reposted the same number of
+// chunks. Both counters are cumulative over the connection, so they stay in lockstep and
+// at most one ack is ever in flight - that is why ND_WINDOW leaves one slot spare.
+
+static constexpr uint32_t ND_CAPS_MAGIC = 0x4E445232; // 'NDR2', guards against an ibverbs peer
+static constexpr uint32_t ND_MSG_MAGIC  = 0x4E444D31; // 'NDM1'
+
+static constexpr size_t   ND_PAYLOAD    = 256 * 1024;      // provider caps a transfer at 1 MiB
+static constexpr int      ND_RX_DEPTH   = 24;              // pre-posted receives: 24 x 256 KiB = 6 MiB
+static constexpr int      ND_WINDOW     = ND_RX_DEPTH - 1; // chunks in flight before an ack is required
+static constexpr int      ND_CONNECT_TIMEOUT_S = 20;
+static constexpr uint64_t ND_POLL_SPIN  = 4096;
+static constexpr uint32_t ND_POLL_TICK_MS = 200;   // how long to sleep on the CQ between peer liveness checks
+static constexpr uint32_t ND_REAP_MS      = 200;   // bounded reap of a pending CQ notify during teardown
+static constexpr uint32_t ND_MAX_EMPTY_NOTIFY = 64;      // CQ claims ready but yields nothing this many times
+static constexpr uint32_t ND_MAX_IDLE_STEPS   = 100000;  // completions consumed while no payload arrives
+static constexpr uint16_t ND_CM_PORT    = 23517;   // fixed by the provider's connection manager
+
+enum nd_msg_type : uint32_t {
+    ND_MSG_DATA = 1,
+    ND_MSG_ACK  = 2,
+    ND_MSG_BYE  = 3,
+};
+
+struct nd_msg_hdr {
+    uint32_t magic;
+    uint32_t type;
+    uint32_t len;
+    uint32_t seq;
+};
+
+static constexpr size_t ND_SLOT = ND_PAYLOAD + sizeof(nd_msg_hdr);
+
+struct nd_caps {
+    uint32_t reserved0; // must stay zero: an ibverbs peer reads this as qpn and declines the offer
+    uint32_t magic;
+    uint32_t ipv4;      // network byte order
+    uint32_t flags;
+    uint8_t  reserved[8];
+};
+
+static_assert(sizeof(nd_caps) == RPC_CONN_CAPS_SIZE, "nd_caps must match conn_caps size");
+
+// receive contexts are 1-based so that a null context never looks like slot 0
+static inline void * nd_ctx_recv(int slot) { return (void *)(uintptr_t)(slot + 1); }
+static inline int    nd_ctx_slot(void * ctx) { return (int)(uintptr_t)ctx - 1; }
+static void * const  ND_CTX_SEND = (void *)(uintptr_t)(ND_RX_DEPTH + 2);
+
+struct nd_ov {
+    OVERLAPPED ov = {};
+
+    bool init() {
+        ov.hEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        return ov.hEvent != nullptr;
+    }
+
+    ~nd_ov() {
+        if (ov.hEvent) {
+            CloseHandle(ov.hEvent);
+        }
+    }
+};
+
+static bool nd_done(HRESULT hr, IND2Overlapped * obj, OVERLAPPED * ov) {
+    if (hr == ND_PENDING) {
+        hr = obj->GetOverlappedResult(ov, TRUE);
+    }
+    return SUCCEEDED(hr);
+}
+
+struct nd_rx_item {
+    int      slot;
+    uint32_t len;
+    uint32_t off;
+};
+
+struct nd_conn {
+    IND2Adapter         * adapter   = nullptr;
+    IND2CompletionQueue * cq        = nullptr;
+    IND2QueuePair       * qp        = nullptr;
+    IND2Connector       * connector = nullptr;
+    IND2Listener        * listener  = nullptr;
+    IND2MemoryRegion    * tx_mr     = nullptr;
+    IND2MemoryRegion    * rx_mr     = nullptr;
+    HANDLE                file      = nullptr;
+
+    nd_ov ov;
+    nd_ov ov_listen;
+    nd_ov ov_cq;      // kept separate: a notify can still be pending while teardown reuses ov
+
+    uint8_t * tx_buf   = nullptr;
+    uint8_t * rx_buf   = nullptr;
+    UINT32    tx_token = 0;
+    UINT32    rx_token = 0;
+
+    struct sockaddr_in local = {};
+    struct sockaddr_in peer  = {};
+
+    std::deque<nd_rx_item> rx_ready;
+    bool     connected    = false;
+    bool     peer_gone    = false;
+    bool     notify_armed = false;
+    int      ack_pending  = 0;
+    int      send_done    = 0;
+    int      tx_since_ack = 0;
+    int      rx_since_ack = 0;
+    uint32_t tx_seq       = 0;
+
+    uint8_t * rx_slot(int i) const {
+        return rx_buf + (size_t)i * ND_SLOT;
+    }
+
+    bool post_rx(int i) {
+        ND2_SGE sge = {};
+        sge.Buffer            = rx_slot(i);
+        sge.BufferLength      = (ULONG)ND_SLOT;
+        sge.MemoryRegionToken = rx_token;
+        return SUCCEEDED(qp->Receive(nd_ctx_recv(i), &sge, 1));
+    }
+
+    ~nd_conn() {
+        if (connected) {
+            LOG_DBG("ND tearing down connection (%u chunks sent)\n", tx_seq);
+        }
+        if (notify_armed && cq) {
+            if (WaitForSingleObject(ov_cq.ov.hEvent, ND_REAP_MS) == WAIT_OBJECT_0) {
+                cq->GetOverlappedResult(&ov_cq.ov, FALSE);
+            }
+            notify_armed = false;
+        }
+        if (connector) {
+            HRESULT hr = connector->Disconnect(&ov.ov);
+            if (hr == ND_PENDING) {
+                connector->GetOverlappedResult(&ov.ov, TRUE);
+            }
+        }
+        if (qp) {
+            qp->Release();
+        }
+        if (tx_mr) {
+            HRESULT hr = tx_mr->Deregister(&ov.ov);
+            if (hr == ND_PENDING) {
+                tx_mr->GetOverlappedResult(&ov.ov, TRUE);
+            }
+            tx_mr->Release();
+        }
+        if (rx_mr) {
+            HRESULT hr = rx_mr->Deregister(&ov.ov);
+            if (hr == ND_PENDING) {
+                rx_mr->GetOverlappedResult(&ov.ov, TRUE);
+            }
+            rx_mr->Release();
+        }
+        if (cq) {
+            cq->Release();
+        }
+        if (listener) {
+            listener->Release();
+        }
+        if (connector) {
+            connector->Release();
+        }
+        if (adapter) {
+            adapter->Release();
+        }
+        if (file && file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+        }
+        _aligned_free(tx_buf);
+        _aligned_free(rx_buf);
+    }
+};
+
+#endif // GGML_RPC_ND
+
 struct socket_t::impl {
-    impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
+    impl(sockfd_t fd, bool is_server = false) : use_rdma(false), is_server(is_server), fd(fd) {}
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
-#ifdef GGML_RPC_RDMA
+#if defined(GGML_RPC_RDMA) || defined(GGML_RPC_ND)
     bool tcp_peer_closed();
+#endif
+
+#ifdef GGML_RPC_RDMA
     std::optional<rdma_gid_t> rdma_build_target_gid();
     bool rdma_probe();
     bool rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, const uint8_t * remote_gid);
@@ -133,7 +334,27 @@ struct socket_t::impl {
     std::unique_ptr<rdma_conn> rdma;
     rdma_local_info            rdma_local = {};
 #endif // GGML_RPC_RDMA
+
+#ifdef GGML_RPC_ND
+    bool nd_local_addr(struct sockaddr_in * out);
+    bool nd_setup(const struct sockaddr_in & local_addr);
+    bool nd_setup_any(struct sockaddr_in * chosen);
+    bool nd_listen();
+    bool nd_accept();
+    bool nd_connect(const struct sockaddr_in & peer_addr);
+    bool nd_poll(ND2_RESULT * res);
+    bool nd_step();
+    bool nd_post_send(size_t len);
+    bool nd_send_ack();
+    bool nd_send_bye();
+    bool nd_send(const void * data, size_t size);
+    bool nd_recv(void * data, size_t size);
+
+    std::unique_ptr<nd_conn> nd;
+    bool use_nd = false;
+#endif // GGML_RPC_ND
     bool     use_rdma;
+    bool     is_server;
     sockfd_t fd;
 };
 
@@ -141,6 +362,12 @@ socket_t::impl::~impl() {
 #ifdef GGML_RPC_RDMA
     rdma.reset();
 #endif // GGML_RPC_RDMA
+#ifdef GGML_RPC_ND
+    if (use_nd && nd && nd->connected && !nd->peer_gone) {
+        (void) nd_send_bye();
+    }
+    nd.reset();
+#endif // GGML_RPC_ND
     LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
 #ifdef _WIN32
     if (fd != INVALID_SOCKET) closesocket(this->fd);
@@ -149,18 +376,36 @@ socket_t::impl::~impl() {
 #endif
 }
 
-#ifdef GGML_RPC_RDMA
+#if defined(GGML_RPC_RDMA) || defined(GGML_RPC_ND)
 
+// Once an RDMA transport is active no payload travels over the TCP socket, so any
+// readability on it means end-of-stream rather than pending data. This is the only
+// way to notice a peer that vanished without an orderly shutdown.
 bool socket_t::impl::tcp_peer_closed() {
+#ifdef _WIN32
+    if (fd == INVALID_SOCKET) return false;
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(fd, &rd);
+    timeval tv = { 0, 0 };
+    if (select(0, &rd, nullptr, nullptr, &tv) <= 0) {
+        return false;
+    }
+    char b;
+    int r = recv(fd, &b, 1, MSG_PEEK);
+    if (r == 0) return true;
+    return r < 0 && WSAGetLastError() != WSAEWOULDBLOCK;
+#else
     if (fd < 0) return false;
-#ifndef _WIN32
     struct pollfd pfd = { fd, POLLIN | POLLRDHUP, 0 };
     int r = poll(&pfd, 1, 0);
     return r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLRDHUP));
-#else
-    return false;
 #endif
 }
+
+#endif // GGML_RPC_RDMA || GGML_RPC_ND
+
+#ifdef GGML_RPC_RDMA
 
 // Build a RoCE GID-shaped 16-byte target from a TCP socket's local address.
 // Used to match the socket's local IP against the kernel's GID table so that
@@ -459,10 +704,545 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 
 #endif // GGML_RPC_RDMA
 
+#ifdef GGML_RPC_ND
+
+struct nd_addr_buf { char s[32]; };
+
+static nd_addr_buf nd_addr_str(const struct sockaddr_in & sa) {
+    nd_addr_buf b;
+    char ip[INET_ADDRSTRLEN] = "?";
+    InetNtopA(AF_INET, (void *)&sa.sin_addr, ip, sizeof(ip));
+    snprintf(b.s, sizeof(b.s), "%s:%u", ip, (unsigned)ntohs(sa.sin_port));
+    return b;
+}
+
+bool socket_t::impl::nd_local_addr(struct sockaddr_in * out) {
+    // an explicit override lets the RDMA NIC differ from the one carrying the TCP control channel
+    if (const char * env = std::getenv("GGML_ND_ADDR")) {
+        memset(out, 0, sizeof(*out));
+        out->sin_family = AF_INET;
+        if (InetPtonA(AF_INET, env, &out->sin_addr) != 1) {
+            GGML_LOG_ERROR("GGML_ND_ADDR is not a valid IPv4 address: %s\n", env);
+            return false;
+        }
+        LOG_DBG("ND local address %s (from GGML_ND_ADDR)\n", nd_addr_str(*out).s);
+        return true;
+    }
+    int len = sizeof(*out);
+    if (getsockname(fd, (struct sockaddr *)out, &len) != 0 || out->sin_family != AF_INET) {
+        LOG_DBG("ND getsockname on the TCP channel failed, no local address\n");
+        return false;
+    }
+    out->sin_port = 0;
+    LOG_DBG("ND local address %s (from the TCP channel)\n", nd_addr_str(*out).s);
+    return true;
+}
+
+bool socket_t::impl::nd_setup(const struct sockaddr_in & local_addr) {
+    auto c = std::make_unique<nd_conn>();
+    if (!c->ov.init() || !c->ov_listen.init() || !c->ov_cq.init()) {
+        return false;
+    }
+    c->local = local_addr;
+
+    HRESULT hr = NdOpenAdapter(IID_IND2Adapter, (const struct sockaddr *)&c->local, sizeof(c->local),
+                               (void **)&c->adapter);
+    if (FAILED(hr)) {
+        LOG_DBG("NdOpenAdapter(%s) failed: 0x%08lx\n", nd_addr_str(c->local).s, (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND adapter opened on %s\n", nd_addr_str(c->local).s);
+    hr = c->adapter->CreateOverlappedFile(&c->file);
+    if (FAILED(hr)) {
+        LOG_DBG("ND CreateOverlappedFile failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+
+    ND2_ADAPTER_INFO info = {};
+    info.InfoVersion = ND_VERSION_2;
+    ULONG cb_info = sizeof(info);
+    hr = c->adapter->Query(&info, &cb_info);
+    if (FAILED(hr)) {
+        LOG_DBG("ND adapter Query failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND adapter vendor=0x%04x device=0x%04x id=0x%016llx flags=0x%08lx\n",
+            (unsigned)info.VendorId, (unsigned)info.DeviceId,
+            (unsigned long long)info.AdapterId, (unsigned long)info.AdapterFlags);
+    LOG_DBG("ND adapter limits: transfer=%lu inline=%lu reg=%zu sge(init/recv)=%lu/%lu\n",
+            (unsigned long)info.MaxTransferLength, (unsigned long)info.MaxInlineDataSize,
+            (size_t)info.MaxRegistrationSize,
+            (unsigned long)info.MaxInitiatorSge, (unsigned long)info.MaxReceiveSge);
+    LOG_DBG("ND adapter depths: rq=%lu iq=%lu cq=%lu\n",
+            (unsigned long)info.MaxReceiveQueueDepth, (unsigned long)info.MaxInitiatorQueueDepth,
+            (unsigned long)info.MaxCompletionQueueDepth);
+    if (info.MaxTransferLength < ND_SLOT || info.MaxReceiveQueueDepth < ND_RX_DEPTH) {
+        GGML_LOG_ERROR("ND adapter limits too small (transfer=%lu, rq=%lu)\n",
+                       (unsigned long)info.MaxTransferLength, (unsigned long)info.MaxReceiveQueueDepth);
+        return false;
+    }
+
+    c->tx_buf = (uint8_t *)_aligned_malloc(ND_SLOT, 4096);
+    c->rx_buf = (uint8_t *)_aligned_malloc(ND_SLOT * ND_RX_DEPTH, 4096);
+    if (!c->tx_buf || !c->rx_buf) {
+        return false;
+    }
+
+    hr = c->adapter->CreateMemoryRegion(IID_IND2MemoryRegion, c->file, (void **)&c->tx_mr);
+    if (FAILED(hr)) {
+        return false;
+    }
+    hr = c->adapter->CreateMemoryRegion(IID_IND2MemoryRegion, c->file, (void **)&c->rx_mr);
+    if (FAILED(hr)) {
+        return false;
+    }
+    hr = c->tx_mr->Register(c->tx_buf, ND_SLOT, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &c->ov.ov);
+    if (!nd_done(hr, c->tx_mr, &c->ov.ov)) {
+        LOG_DBG("ND tx Register failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    hr = c->rx_mr->Register(c->rx_buf, ND_SLOT * ND_RX_DEPTH, ND_MR_FLAG_ALLOW_LOCAL_WRITE, &c->ov.ov);
+    if (!nd_done(hr, c->rx_mr, &c->ov.ov)) {
+        LOG_DBG("ND rx Register failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    c->tx_token = c->tx_mr->GetLocalToken();
+    c->rx_token = c->rx_mr->GetLocalToken();
+    LOG_DBG("ND registered tx=%zu B (token 0x%08lx) rx=%zu B (token 0x%08lx)\n",
+            ND_SLOT, (unsigned long)c->tx_token,
+            ND_SLOT * (size_t)ND_RX_DEPTH, (unsigned long)c->rx_token);
+
+    const ULONG cq_depth = std::min<ULONG>(info.MaxCompletionQueueDepth, 2 * ND_RX_DEPTH + 8);
+    hr = c->adapter->CreateCompletionQueue(IID_IND2CompletionQueue, c->file, cq_depth, 0, 0, (void **)&c->cq);
+    if (FAILED(hr)) {
+        LOG_DBG("ND CreateCompletionQueue(depth=%lu) failed: 0x%08lx\n", (unsigned long)cq_depth, (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND completion queue created (depth=%lu)\n", (unsigned long)cq_depth);
+    const ULONG iq_depth = std::min<ULONG>(info.MaxInitiatorQueueDepth, ND_RX_DEPTH);
+    hr = c->adapter->CreateQueuePair(IID_IND2QueuePair, c->cq, c->cq, nullptr,
+                                     ND_RX_DEPTH, iq_depth,
+                                     1, 1, 0, (void **)&c->qp);
+    if (FAILED(hr)) {
+        LOG_DBG("ND CreateQueuePair(rq=%d iq=%lu) failed: 0x%08lx\n",
+                ND_RX_DEPTH, (unsigned long)iq_depth, (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND queue pair created (rq=%d iq=%lu sge=1)\n", ND_RX_DEPTH, (unsigned long)iq_depth);
+    hr = c->adapter->CreateConnector(IID_IND2Connector, c->file, (void **)&c->connector);
+    if (FAILED(hr)) {
+        LOG_DBG("ND CreateConnector failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+
+    // receives must be posted before the connection is accepted or completed
+    for (int i = 0; i < ND_RX_DEPTH; i++) {
+        if (!c->post_rx(i)) {
+            LOG_DBG("ND initial Receive post failed at slot %d\n", i);
+            return false;
+        }
+    }
+    LOG_DBG("ND posted %d receives of %zu B each\n", ND_RX_DEPTH, ND_SLOT);
+
+    nd = std::move(c);
+    return true;
+}
+
+// tries the adapter behind the TCP channel first, then any other ND capable local address
+bool socket_t::impl::nd_setup_any(struct sockaddr_in * chosen) {
+    struct sockaddr_in addr = {};
+    if (nd_local_addr(&addr) && nd_setup(addr)) {
+        *chosen = addr;
+        return true;
+    }
+    nd.reset();
+    if (std::getenv("GGML_ND_ADDR")) {
+        // an explicit choice must not be silently overridden
+        return false;
+    }
+    LOG_DBG("ND setup on the TCP-local address failed, scanning ND capable addresses\n");
+
+    SIZE_T cb_list = 0;
+    NdQueryAddressList(0, nullptr, &cb_list);
+    if (cb_list == 0) {
+        LOG_DBG("ND NdQueryAddressList reports no ND capable local addresses\n");
+        return false;
+    }
+    std::vector<uint8_t> raw(cb_list);
+    SOCKET_ADDRESS_LIST * list = (SOCKET_ADDRESS_LIST *)raw.data();
+    if (FAILED(NdQueryAddressList(0, list, &cb_list))) {
+        LOG_DBG("ND NdQueryAddressList failed\n");
+        return false;
+    }
+    LOG_DBG("ND found %d local address(es)\n", list->iAddressCount);
+    for (int i = 0; i < list->iAddressCount; i++) {
+        const struct sockaddr * sa = list->Address[i].lpSockaddr;
+        if (!sa || sa->sa_family != AF_INET) {
+            continue;
+        }
+        memset(&addr, 0, sizeof(addr));
+        memcpy(&addr, sa, sizeof(addr));
+        addr.sin_port = 0;
+        LOG_DBG("ND trying local address %s\n", nd_addr_str(addr).s);
+        if (nd_setup(addr)) {
+            *chosen = addr;
+            return true;
+        }
+        nd.reset();
+    }
+    return false;
+}
+
+bool socket_t::impl::nd_listen() {
+    nd_conn * c = nd.get();
+
+    // the provider binds the CM port with SO_REUSEADDR, so a second server on this host would
+    // bind it again and inbound connections would be split between the two listeners at random.
+    // a plain bind without SO_REUSEADDR is rejected while another listener holds the port.
+    {
+        sockfd_t probe = socket(AF_INET, SOCK_STREAM, 0);
+        if (probe == INVALID_SOCKET) {
+            return false;
+        }
+        struct sockaddr_in probe_addr = c->local;
+        probe_addr.sin_port = htons(ND_CM_PORT);
+        const bool taken = bind(probe, (const struct sockaddr *)&probe_addr, sizeof(probe_addr)) != 0;
+        closesocket(probe);
+        if (taken) {
+            LOG_DBG("ND CM port %u already in use on this host, staying on TCP\n", ND_CM_PORT);
+            return false;
+        }
+    }
+
+    HRESULT hr = c->adapter->CreateListener(IID_IND2Listener, c->file, (void **)&c->listener);
+    if (FAILED(hr)) {
+        LOG_DBG("ND CreateListener failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    hr = c->listener->Bind((const struct sockaddr *)&c->local, sizeof(c->local));
+    if (FAILED(hr)) {
+        LOG_DBG("ND listener Bind failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    hr = c->listener->Listen(1);
+    if (FAILED(hr)) {
+        LOG_DBG("ND Listen failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND listening on %s (CM port %u)\n", nd_addr_str(c->local).s, ND_CM_PORT);
+    return true;
+}
+
+bool socket_t::impl::nd_accept() {
+    nd_conn * c = nd.get();
+
+    LOG_DBG("ND waiting for a connection request (timeout %ds)\n", ND_CONNECT_TIMEOUT_S);
+    // GetConnectionRequest blocks, so bound the wait in case the peer never dials in
+    auto pending = std::async(std::launch::async, [c]() {
+        return c->listener->GetConnectionRequest(c->connector, &c->ov_listen.ov);
+    });
+    if (pending.wait_for(std::chrono::seconds(ND_CONNECT_TIMEOUT_S)) != std::future_status::ready) {
+        c->listener->CancelOverlappedRequests();
+        pending.wait();
+        GGML_LOG_ERROR("ND connection request timed out\n");
+        return false;
+    }
+    HRESULT hr = pending.get();
+    if (!nd_done(hr, c->listener, &c->ov_listen.ov)) {
+        LOG_DBG("ND GetConnectionRequest failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    struct sockaddr_in peer = {};
+    ULONG cb_peer = sizeof(peer);
+    if (SUCCEEDED(c->connector->GetPeerAddress((struct sockaddr *)&peer, &cb_peer))) {
+        LOG_DBG("ND connection request from %s\n", nd_addr_str(peer).s);
+    }
+    hr = c->connector->Accept(c->qp, 0, 0, nullptr, 0, &c->ov.ov);
+    if (!nd_done(hr, c->connector, &c->ov.ov)) {
+        LOG_DBG("ND Accept failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND connection accepted\n");
+    c->connected = true;
+    return true;
+}
+
+bool socket_t::impl::nd_connect(const struct sockaddr_in & peer_addr) {
+    // the NIC that reaches the peer's RDMA address may not be the one carrying the TCP channel
+    struct sockaddr_in resolved = {};
+    SIZE_T cb_resolved = sizeof(resolved);
+    HRESULT hr = NdResolveAddress((const struct sockaddr *)&peer_addr, sizeof(peer_addr),
+                                  (struct sockaddr *)&resolved, &cb_resolved);
+    if (SUCCEEDED(hr) && resolved.sin_family == AF_INET &&
+        resolved.sin_addr.s_addr != nd->local.sin_addr.s_addr) {
+        resolved.sin_port = 0;
+        LOG_DBG("ND peer %s is reached via %s, reopening the adapter\n",
+                nd_addr_str(peer_addr).s, nd_addr_str(resolved).s);
+        nd.reset();
+        if (!nd_setup(resolved)) {
+            return false;
+        }
+    }
+
+    nd_conn * c = nd.get();
+    c->peer = peer_addr;
+
+    hr = c->connector->Bind((const struct sockaddr *)&c->local, sizeof(c->local));
+    if (FAILED(hr)) {
+        LOG_DBG("ND connector Bind failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND connecting %s -> %s (CM port %u, timeout %ds)\n",
+            nd_addr_str(c->local).s, nd_addr_str(c->peer).s, ND_CM_PORT, ND_CONNECT_TIMEOUT_S);
+    // Connect blocks in the provider's TCP-based CM, so bound it the same way nd_accept is bounded
+    auto pending = std::async(std::launch::async, [c]() {
+        return c->connector->Connect(c->qp, (const struct sockaddr *)&c->peer, sizeof(c->peer),
+                                     0, 0, nullptr, 0, &c->ov.ov);
+    });
+    if (pending.wait_for(std::chrono::seconds(ND_CONNECT_TIMEOUT_S)) != std::future_status::ready) {
+        c->connector->CancelOverlappedRequests();
+        pending.wait();
+        GGML_LOG_ERROR("ND connect timed out\n");
+        return false;
+    }
+    hr = pending.get();
+    if (!nd_done(hr, c->connector, &c->ov.ov)) {
+        LOG_DBG("ND Connect failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    hr = c->connector->CompleteConnect(&c->ov.ov);
+    if (!nd_done(hr, c->connector, &c->ov.ov)) {
+        LOG_DBG("ND CompleteConnect failed: 0x%08lx\n", (unsigned long)hr);
+        return false;
+    }
+    LOG_DBG("ND connection established with %s\n", nd_addr_str(c->peer).s);
+    c->connected = true;
+    return true;
+}
+
+bool socket_t::impl::nd_poll(ND2_RESULT * res) {
+    nd_conn * c = nd.get();
+    uint32_t ready_no_result = 0;
+    for (uint64_t s = 0; ; s++) {
+        if (c->cq->GetResults(res, 1) == 1) {
+            if (FAILED(res->Status)) {
+                // the provider reports every error event as a failed send, so the request
+                // context is the only reliable way to tell what actually failed
+                const int slot = nd_ctx_slot(res->RequestContext);
+                GGML_LOG_ERROR("ND completion failed: status=0x%08lx type=%d on %s (bytes=%lu)\n",
+                               (unsigned long)res->Status, (int)res->RequestType,
+                               res->RequestContext == ND_CTX_SEND ? "send" :
+                               (slot >= 0 && slot < ND_RX_DEPTH) ? "recv" : "unknown request",
+                               (unsigned long)res->BytesTransferred);
+                if (slot >= 0 && slot < ND_RX_DEPTH) {
+                    GGML_LOG_ERROR("ND   failing recv slot %d of %d\n", slot, ND_RX_DEPTH);
+                }
+                return false;
+            }
+            return true;
+        }
+        if (s < ND_POLL_SPIN) {
+            YieldProcessor();
+            continue;
+        }
+        if (!c->notify_armed) {
+            HRESULT hr = c->cq->Notify(ND_CQ_NOTIFY_ANY, &c->ov_cq.ov);
+            // ND_PENDING has success severity, so it must be tested before SUCCEEDED/FAILED
+            if (hr == ND_PENDING) {
+                c->notify_armed = true;
+            } else if (FAILED(hr)) {
+                GGML_LOG_ERROR("ND CQ Notify failed: 0x%08lx\n", (unsigned long)hr);
+                return false;
+            } else {
+                // the queue claims to be non-empty yet yields nothing, so spinning here would
+                // never end; bail out rather than burn a core forever
+                if (++ready_no_result > ND_MAX_EMPTY_NOTIFY) {
+                    GGML_LOG_ERROR("ND CQ reports ready but returns no completion, giving up\n");
+                    return false;
+                }
+                s = 0;
+                continue;
+            }
+        }
+        // the provider cannot cancel a pending notify, so keep waiting on the same request
+        // and only bound how long we sleep before checking whether the peer is still there
+        const DWORD w = WaitForSingleObject(c->ov_cq.ov.hEvent, ND_POLL_TICK_MS);
+        if (w == WAIT_TIMEOUT) {
+            if (tcp_peer_closed()) {
+                LOG_DBG("ND peer dropped the control channel\n");
+                return false;
+            }
+            continue;
+        }
+        if (w != WAIT_OBJECT_0) {
+            GGML_LOG_ERROR("ND CQ wait failed: %lu\n", (unsigned long)GetLastError());
+            return false;
+        }
+        c->notify_armed = false;
+        HRESULT hr = c->cq->GetOverlappedResult(&c->ov_cq.ov, FALSE);
+        if (FAILED(hr)) {
+            GGML_LOG_ERROR("ND CQ notify result failed: 0x%08lx\n", (unsigned long)hr);
+            return false;
+        }
+        s = 0;
+    }
+}
+
+// consumes exactly one completion and routes it to the send, ack or data path
+bool socket_t::impl::nd_step() {
+    nd_conn * c = nd.get();
+    ND2_RESULT res = {};
+    if (!nd_poll(&res)) {
+        return false;
+    }
+    if (res.RequestContext == ND_CTX_SEND) {
+        c->send_done++;
+        return true;
+    }
+    const int slot = nd_ctx_slot(res.RequestContext);
+    if (slot < 0 || slot >= ND_RX_DEPTH) {
+        GGML_LOG_ERROR("ND completion with unknown context\n");
+        return false;
+    }
+    nd_msg_hdr hdr = {};
+    memcpy(&hdr, c->rx_slot(slot), sizeof(hdr));
+    if (hdr.magic != ND_MSG_MAGIC) {
+        GGML_LOG_ERROR("ND framing lost (magic 0x%08x)\n", hdr.magic);
+        return false;
+    }
+    if (hdr.type == ND_MSG_BYE) {
+        LOG_DBG("ND peer closed the connection\n");
+        c->peer_gone = true;
+        return false;
+    }
+    if (hdr.type == ND_MSG_ACK) {
+        c->ack_pending++;
+        return c->post_rx(slot);
+    }
+    if (hdr.type != ND_MSG_DATA || hdr.len == 0 || hdr.len > ND_PAYLOAD) {
+        GGML_LOG_ERROR("ND bad message (type=%u len=%u)\n", hdr.type, hdr.len);
+        return false;
+    }
+    c->rx_ready.push_back({ slot, hdr.len, 0 });
+    return true;
+}
+
+bool socket_t::impl::nd_post_send(size_t len) {
+    nd_conn * c = nd.get();
+    ND2_SGE sge = {};
+    sge.Buffer            = c->tx_buf;
+    sge.BufferLength      = (ULONG)len;
+    sge.MemoryRegionToken = c->tx_token;
+
+    c->send_done = 0;
+    if (FAILED(c->qp->Send(ND_CTX_SEND, &sge, 1, 0))) {
+        GGML_LOG_ERROR("ND Send post failed\n");
+        return false;
+    }
+    while (c->send_done == 0) {
+        if (!nd_step()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool socket_t::impl::nd_send_ack() {
+    nd_conn * c = nd.get();
+    const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_ACK, 0, c->tx_seq++ };
+    memcpy(c->tx_buf, &hdr, sizeof(hdr));
+    return nd_post_send(sizeof(hdr));
+}
+
+// The provider raises no completion and no notification when a peer disconnects, so an
+// explicit bye is what lets the other side leave its completion queue wait promptly.
+// It rides in the slot ND_WINDOW keeps spare, so it needs no flow control of its own.
+bool socket_t::impl::nd_send_bye() {
+    nd_conn * c = nd.get();
+    const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_BYE, 0, c->tx_seq++ };
+    memcpy(c->tx_buf, &hdr, sizeof(hdr));
+    return nd_post_send(sizeof(hdr));
+}
+
+bool socket_t::impl::nd_send(const void * data, size_t size) {
+    nd_conn * c = nd.get();
+    const uint8_t * src = (const uint8_t *)data;
+    size_t rem = size;
+    while (rem > 0) {
+        if (c->tx_since_ack >= ND_WINDOW) {
+            while (c->ack_pending == 0) {
+                if (!nd_step()) {
+                    return false;
+                }
+            }
+            c->ack_pending--;
+            c->tx_since_ack = 0;
+        }
+        const size_t chunk = std::min(rem, ND_PAYLOAD);
+        const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_DATA, (uint32_t)chunk, c->tx_seq++ };
+        memcpy(c->tx_buf, &hdr, sizeof(hdr));
+        memcpy(c->tx_buf + sizeof(hdr), src, chunk);
+        if (!nd_post_send(sizeof(hdr) + chunk)) {
+            return false;
+        }
+        c->tx_since_ack++;
+        src += chunk;
+        rem -= chunk;
+    }
+    return true;
+}
+
+bool socket_t::impl::nd_recv(void * data, size_t size) {
+    nd_conn * c = nd.get();
+    uint8_t * dst = (uint8_t *)data;
+    size_t rem = size;
+    while (rem > 0) {
+        uint32_t idle_steps = 0;
+        while (c->rx_ready.empty()) {
+            if (!nd_step()) {
+                return false;
+            }
+            // completions that never turn into payload mean the queue is replaying
+            // something stale; without this the loop would spin until the peer gives up
+            if (++idle_steps > ND_MAX_IDLE_STEPS) {
+                GGML_LOG_ERROR("ND consumed %u completions without receiving data\n", idle_steps);
+                return false;
+            }
+        }
+        nd_rx_item & it = c->rx_ready.front();
+        const size_t take = std::min((size_t)(it.len - it.off), rem);
+        memcpy(dst, c->rx_slot(it.slot) + sizeof(nd_msg_hdr) + it.off, take);
+        dst += take;
+        rem -= take;
+        it.off += (uint32_t)take;
+        if (it.off == it.len) {
+            const int slot = it.slot;
+            c->rx_ready.pop_front();
+            if (!c->post_rx(slot)) {
+                return false;
+            }
+            if (++c->rx_since_ack >= ND_WINDOW) {
+                c->rx_since_ack = 0;
+                if (!nd_send_ack()) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+#endif // GGML_RPC_ND
+
 bool socket_t::impl::send_data(const void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
         return rdma_send(data, size);
+    }
+#endif
+#ifdef GGML_RPC_ND
+    if (use_nd) {
+        return nd_send(data, size);
     }
 #endif
     size_t bytes_sent = 0;
@@ -483,6 +1263,11 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
 #ifdef GGML_RPC_RDMA
     if (use_rdma) {
         return rdma_recv(data, size);
+    }
+#endif
+#ifdef GGML_RPC_ND
+    if (use_nd) {
+        return nd_recv(data, size);
     }
 #endif
     size_t bytes_recv = 0;
@@ -517,6 +1302,26 @@ void socket_t::impl::get_caps(uint8_t * local_caps) {
         rdma.reset();
     }
 #endif // GGML_RPC_RDMA
+#ifdef GGML_RPC_ND
+    struct sockaddr_in addr = {};
+    LOG_DBG("ND negotiating as %s\n", is_server ? "server" : "client");
+    if (!nd_setup_any(&addr)) {
+        LOG_DBG("ND no usable adapter, offering TCP only\n");
+        nd.reset();
+        return;
+    }
+    // only the server advertises an address; the client just signals that it can dial in
+    if (is_server && !nd_listen()) {
+        nd.reset();
+        return;
+    }
+    nd_caps nc = {};
+    nc.magic = ND_CAPS_MAGIC;
+    nc.ipv4  = is_server ? (uint32_t)addr.sin_addr.s_addr : 0;
+    memcpy(local_caps, &nc, sizeof(nc));
+    LOG_DBG("ND offering NetworkDirect (advertised address %s)\n",
+            is_server ? nd_addr_str(addr).s : "none, client dials out");
+#endif // GGML_RPC_ND
 }
 
 void socket_t::impl::update_caps(const uint8_t * remote_caps) {
@@ -535,6 +1340,34 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
     } else {
         GGML_LOG_ERROR("RDMA activate failed, staying on TCP\n");
         rdma.reset();
+    }
+#elif defined(GGML_RPC_ND)
+    if (!nd) {
+        return;
+    }
+    nd_caps nc = {};
+    memcpy(&nc, remote_caps, sizeof(nc));
+    if (nc.reserved0 != 0 || nc.magic != ND_CAPS_MAGIC) {
+        LOG_DBG("ND peer did not offer NetworkDirect, staying on TCP\n");
+        nd.reset();
+        return;
+    }
+    bool ok;
+    if (is_server) {
+        ok = nd_accept();
+    } else {
+        struct sockaddr_in peer_addr = {};
+        peer_addr.sin_family      = AF_INET;
+        peer_addr.sin_addr.s_addr = nc.ipv4;
+        ok = nc.ipv4 != 0 && nd_connect(peer_addr);
+    }
+    if (ok) {
+        use_nd = true;
+        GGML_LOG_INFO("NetworkDirect activated: window=%d rx_depth=%d chunk=%zu KiB\n",
+                      ND_WINDOW, ND_RX_DEPTH, ND_PAYLOAD / 1024);
+    } else {
+        GGML_LOG_ERROR("NetworkDirect setup failed, staying on TCP\n");
+        nd.reset();
     }
 #else
     (void)remote_caps;
@@ -594,7 +1427,7 @@ socket_ptr socket_t::accept() {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd, /*is_server =*/ true)));
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
@@ -664,6 +1497,14 @@ bool rpc_transport_init() {
     if (res != 0) {
         return false;
     }
+#ifdef GGML_RPC_ND
+    HRESULT hr = NdStartup();
+    if (FAILED(hr)) {
+        GGML_LOG_ERROR("NdStartup failed: 0x%08lx, NetworkDirect unavailable\n", (unsigned long)hr);
+    } else {
+        LOG_DBG("NdStartup ok\n");
+    }
+#endif
     g_rpc_transport_wsa_started = true;
     return true;
 #else
@@ -677,6 +1518,9 @@ void rpc_transport_shutdown() {
     if (!g_rpc_transport_wsa_started) {
         return;
     }
+#ifdef GGML_RPC_ND
+    NdCleanup();
+#endif
     WSACleanup();
     g_rpc_transport_wsa_started = false;
 #endif
