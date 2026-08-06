@@ -243,6 +243,8 @@ struct nd_conn {
     int      tx_since_ack = 0;
     int      rx_since_ack = 0;
     uint32_t tx_seq       = 0;
+    size_t   tx_fill      = 0;   // payload bytes staged in tx_buf behind the header
+    int      corked       = 0;
 
     uint8_t * rx_slot(int i) const {
         return rx_buf + (size_t)i * ND_SLOT;
@@ -316,6 +318,8 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    void cork();
+    bool uncork();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
@@ -345,6 +349,7 @@ struct socket_t::impl {
     bool nd_poll(ND2_RESULT * res);
     bool nd_step();
     bool nd_post_send(size_t len);
+    bool nd_flush();
     bool nd_send_ack();
     bool nd_send_bye();
     bool nd_send(const void * data, size_t size);
@@ -1164,36 +1169,57 @@ bool socket_t::impl::nd_send_bye() {
     return nd_post_send(sizeof(hdr));
 }
 
+bool socket_t::impl::nd_flush() {
+    nd_conn * c = nd.get();
+    if (c->tx_fill == 0) {
+        return true;
+    }
+    if (c->tx_since_ack >= ND_WINDOW) {
+        while (c->ack_pending == 0) {
+            if (!nd_step()) {
+                return false;
+            }
+        }
+        c->ack_pending--;
+        c->tx_since_ack = 0;
+    }
+    const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_DATA, (uint32_t)c->tx_fill, c->tx_seq++ };
+    memcpy(c->tx_buf, &hdr, sizeof(hdr));
+    const size_t len = sizeof(hdr) + c->tx_fill;
+    c->tx_fill = 0;
+    if (!nd_post_send(len)) {
+        return false;
+    }
+    c->tx_since_ack++;
+    return true;
+}
+
 bool socket_t::impl::nd_send(const void * data, size_t size) {
     nd_conn * c = nd.get();
     const uint8_t * src = (const uint8_t *)data;
     size_t rem = size;
     while (rem > 0) {
-        if (c->tx_since_ack >= ND_WINDOW) {
-            while (c->ack_pending == 0) {
-                if (!nd_step()) {
-                    return false;
-                }
-            }
-            c->ack_pending--;
-            c->tx_since_ack = 0;
-        }
-        const size_t chunk = std::min(rem, ND_PAYLOAD);
-        const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_DATA, (uint32_t)chunk, c->tx_seq++ };
-        memcpy(c->tx_buf, &hdr, sizeof(hdr));
-        memcpy(c->tx_buf + sizeof(hdr), src, chunk);
-        if (!nd_post_send(sizeof(hdr) + chunk)) {
+        if (c->tx_fill == ND_PAYLOAD && !nd_flush()) {
             return false;
         }
-        c->tx_since_ack++;
-        src += chunk;
-        rem -= chunk;
+        const size_t take = std::min(rem, ND_PAYLOAD - c->tx_fill);
+        memcpy(c->tx_buf + sizeof(nd_msg_hdr) + c->tx_fill, src, take);
+        c->tx_fill += take;
+        src += take;
+        rem -= take;
+    }
+    if (!c->corked) {
+        return nd_flush();
     }
     return true;
 }
 
 bool socket_t::impl::nd_recv(void * data, size_t size) {
     nd_conn * c = nd.get();
+    // a staged request has to reach the peer before we block waiting for its reply
+    if (!nd_flush()) {
+        return false;
+    }
     uint8_t * dst = (uint8_t *)data;
     size_t rem = size;
     while (rem > 0) {
@@ -1285,6 +1311,25 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
         }
         bytes_recv += (size_t)n;
     }
+    return true;
+}
+
+void socket_t::impl::cork() {
+#ifdef GGML_RPC_ND
+    if (use_nd) {
+        nd->corked++;
+    }
+#endif
+}
+
+bool socket_t::impl::uncork() {
+#ifdef GGML_RPC_ND
+    if (use_nd) {
+        if (nd->corked > 0 && --nd->corked == 0) {
+            return nd_flush();
+        }
+    }
+#endif
     return true;
 }
 
@@ -1387,6 +1432,14 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+void socket_t::cork() {
+    pimpl->cork();
+}
+
+bool socket_t::uncork() {
+    return pimpl->uncork();
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {

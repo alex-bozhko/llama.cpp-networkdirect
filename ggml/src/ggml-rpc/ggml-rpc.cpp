@@ -294,16 +294,12 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!sock->send_data(input, input_size)) {
-        return false;
-    }
-    return true;
+    sock->cork();
+    const bool ok = sock->send_data(&cmd_byte, sizeof(cmd_byte))
+                 && sock->send_data(&input_size, sizeof(input_size))
+                 && sock->send_data(input, input_size);
+    const bool flushed = sock->uncork();
+    return ok && flushed;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -352,13 +348,13 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    // the cache owns the connection: with a weak_ptr it is dropped whenever no buffer holds
+    // it, so every device query pays for a full reconnect
+    static std::unordered_map<std::string, std::shared_ptr<socket_t>> sockets;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
-        }
+        return it->second;
     }
     std::string host;
     int port;
