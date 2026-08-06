@@ -12,6 +12,94 @@
 
 LLM inference in C/C++
 
+> [!WARNING]
+> **This is an experimental fork of llama.cpp, not upstream.**
+>
+> It carries prototype work on the RPC backend (a Windows NetworkDirect RDMA transport and transport-level send batching), a tracing facility that emits an HTML latency report, and a Windows SYCL packaging script. None of it has been reviewed by llama.cpp maintainers and none of it is ready for submission as-is. Expect rough edges, and do not assume upstream behaviour where these features are involved.
+>
+> See [Experimental features](#experimental-features) below. Everything else in this README is upstream documentation.
+
+## Experimental features
+
+### Windows NetworkDirect (RDMA) transport for RPC
+
+An RDMA transport for the RPC backend built on the Windows NetworkDirect Service Provider Interface (NDSPI). It fills the same role on Windows that the existing `GGML_RPC_RDMA` libibverbs/RoCEv2 path fills on Linux. TCP and libibverbs are untouched and remain available.
+
+Build it with a NetworkDirect SDK checkout:
+
+```sh
+cmake -B build -DGGML_RPC=ON -DGGML_RPC_ND=ON -DGGML_RPC_ND_SDK=C:/path/to/NetworkDirect
+cmake --build build --config Release
+```
+
+The SDK checkout must provide `src/ndutil/{ndaddr,ndfrmwrk,ndprov}.cpp`, which are compiled in directly because the prebuilt `ndutil.lib` is `/MT`, and a generated `ndstatus.h` under `out/Release-x64/include` or `out/Debug-x64/include`. `ndstatus.h` is produced from `ndstatus.mc`, so build the SDK first. CMake fails with an explicit message if either is missing.
+
+There are no command-line changes. The transport is negotiated during the HELLO handshake, and if no provider is installed or the adapter cannot be opened, both peers silently stay on TCP. A NetworkDirect-capable server reports:
+
+```
+  transport      : TCP (NetworkDirect auto-negotiate enabled)
+```
+
+Notes:
+
+- The TCP connection is what selects the local adapter. If RDMA and TCP run over different NICs, set `GGML_ND_ADDR` on both peers to the IPv4 address of the RDMA NIC.
+- The reference provider uses a fixed connection-management port, so only one NetworkDirect-enabled `ggml-rpc-server` per host can serve a client at a time. Additional servers detect the port is taken and fall back to TCP.
+- Data moves as two-sided Send/Receive in 256 KiB chunks behind a 16-byte framing header, with 24 pre-posted receives and an ACK-based credit window.
+
+See [tools/rpc/README.md](tools/rpc/README.md) for more detail.
+
+### Batched RPC commands
+
+`socket_t` gained `cork()` and `uncork()`. Sends issued between the two are batched into as few transport messages as possible.
+
+`send_rpc_cmd` writes the command byte, the payload size and the payload as three separate sends. On a message-oriented transport each of those blocks for its own completion, so every command cost three round trips; it is now one. Bulk payloads larger than one 256 KiB chunk still split across messages, as they must.
+
+This is a no-op on TCP, where the kernel already coalesces. It is also wire-compatible in both directions: the receive path already handles a partially consumed message, so a batching client works against a non-batching server.
+
+### Tensor-parallel / RPC trace report
+
+A lightweight tracing facility (`ggml/include/ggml-trace.h`) that records tensor-parallel allreduces and RPC traffic and writes a self-contained HTML report. All entry points compile to no-ops when tracing is off.
+
+```sh
+set GGML_TRACE=1
+llama-cli -m model.gguf -ngl 999 --rpc 192.168.1.10:50052 --split-mode tensor
+```
+
+The report is written to `llama-trace.html`. `llama-cli` writes it on `/exit`; an `atexit` handler is the fallback for other exits.
+
+It contains summary cards (decode steps, allreduce count, butterfly fallback vs native comm, transfer volume, bytes sent and received, wire bytes per decode step), a per-endpoint byte table, and a collapsible timeline. Each decode step expands into its allreduces, and each allreduce into the individual tensor transfers and RPC calls it produced, with per-command totals.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GGML_TRACE` | off | set to `1` to enable tracing |
+| `GGML_TRACE_HTML` | `llama-trace.html` | output path |
+| `GGML_TRACE_MAX_STEPS` | 64 | decode steps recorded in detail; totals stay exact past this |
+| `GGML_TRACE_MAX_EVENTS` | 4096 | rows stored per bucket; totals stay exact past this |
+
+### Windows SYCL drop-in build script
+
+`sycl-build.ps1` builds the SYCL backend with Intel oneAPI and vcpkg.
+
+```powershell
+.\sycl-build.ps1                 # plain SYCL build into .\build
+.\sycl-build.ps1 fp16            # same, with GGML_SYCL_F16
+.\sycl-build.ps1 -DropIn         # redistributable package matching the official release layout
+```
+
+`-DropIn` runs two configures, because `icx` sets `MSVC=TRUE` and therefore takes the MSVC branch in `ggml-cpu/CMakeLists.txt`, which hand-defines `__AVX512VNNI__` and friends instead of enabling the matching clang target features. It produces a `cl` host build (`GGML_BACKEND_DL`, `GGML_CPU_ALL_VARIANTS`, `GGML_RPC`, plus NetworkDirect when the SDK is present) and an `icx` build of `ggml-sycl.dll` only, then assembles `build-dist` from both along with the oneAPI runtime DLLs. `ONEAPI_ROOT` must be set for the runtime collection step.
+
+`-NdSdk` defaults to `C:/repo/local/NetworkDirect`; if that path does not exist the script says so and builds RPC as TCP only. Other parameters: `-BuildDir`, `-VcpkgToolchain`, `-VcpkgTriplet`, `-OneApiSetvars`, and any trailing arguments are passed through to CMake.
+
+### RPC connection cache
+
+`get_socket` cached connections through a `weak_ptr`, so a connection was torn down as soon as no buffer held it and every device query paid for a full reconnect. The cache now owns the connection. This matters far more for RDMA and NetworkDirect, where a reconnect means rebuilding the queue pair, memory registrations and completion queue.
+
+### Debugging
+
+Set `GGML_RPC_DEBUG=1` on both peers to trace transport bring-up: adapter selection and capabilities, memory registration, completion queue and queue pair creation, and each stage of the connection handshake. Every point that can decline to TCP reports why.
+
+On the client, these messages go through the `llama-cli` log filter, so `GGML_RPC_DEBUG=1` alone is not enough. Add `-v` (or `-lv 5`). The server prints them unconditionally.
+
 ## Recent API changes
 
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
