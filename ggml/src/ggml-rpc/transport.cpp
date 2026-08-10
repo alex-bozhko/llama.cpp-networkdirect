@@ -212,6 +212,36 @@ struct nd_rx_item {
     uint32_t off;
 };
 
+// per-connection phase accounting; enabled with GGML_ND_STATS=<messages per report>
+static const char * ND_STATS_ENV = std::getenv("GGML_ND_STATS");
+static const uint64_t ND_STATS = ND_STATS_ENV ? strtoull(ND_STATS_ENV, nullptr, 10) : 0;
+
+struct nd_stats {
+    uint64_t n_send      = 0;   // data messages posted
+    uint64_t n_ack       = 0;   // ack/bye messages posted
+    uint64_t n_rx_post   = 0;   // Receive re-posts
+    uint64_t n_notify    = 0;   // times the user-mode spin gave up and Notify was called
+    uint64_t n_kwait     = 0;   // times a kernel wait was actually entered
+    uint64_t post_us     = 0;   // time inside IND2QueuePair::Send
+    uint64_t rx_post_us  = 0;   // time inside IND2QueuePair::Receive
+    uint64_t cmpl_us     = 0;   // time waiting for our own send completion
+    uint64_t recv_us     = 0;   // time waiting for payload to arrive
+    uint64_t ackw_us     = 0;   // time blocked on flow-control credit
+    uint64_t bytes_tx    = 0;
+    uint64_t bytes_rx    = 0;
+};
+
+static inline uint64_t nd_now_us() {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    static const double s_scale = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return 1000000.0 / double(f.QuadPart);
+    }();
+    return (uint64_t)(double(c.QuadPart) * s_scale);
+}
+
 struct nd_conn {
     IND2Adapter         * adapter   = nullptr;
     IND2CompletionQueue * cq        = nullptr;
@@ -246,6 +276,10 @@ struct nd_conn {
     size_t   tx_fill      = 0;   // payload bytes staged in tx_buf behind the header
     int      corked       = 0;
 
+    nd_stats st;
+    nd_stats st_prev;
+    uint64_t st_t0 = 0;
+
     uint8_t * rx_slot(int i) const {
         return rx_buf + (size_t)i * ND_SLOT;
     }
@@ -255,7 +289,42 @@ struct nd_conn {
         sge.Buffer            = rx_slot(i);
         sge.BufferLength      = (ULONG)ND_SLOT;
         sge.MemoryRegionToken = rx_token;
-        return SUCCEEDED(qp->Receive(nd_ctx_recv(i), &sge, 1));
+        const uint64_t t0 = ND_STATS ? nd_now_us() : 0;
+        const bool ok = SUCCEEDED(qp->Receive(nd_ctx_recv(i), &sge, 1));
+        if (ND_STATS) {
+            st.rx_post_us += nd_now_us() - t0;
+            st.n_rx_post++;
+        }
+        return ok;
+    }
+
+    // reports the delta since the previous report, so a window inside steady-state decode
+    // can be read straight out of the log without model load skewing it
+    void dump_stats(const char * who) {
+        if (!ND_STATS) {
+            return;
+        }
+        const uint64_t now  = nd_now_us();
+        const uint64_t msgs = (st.n_send - st_prev.n_send) + (st.n_ack - st_prev.n_ack);
+        if (msgs == 0) {
+            return;
+        }
+        const double wall = double(now - st_t0);
+        const double d    = double(msgs);
+        GGML_LOG_INFO("ND stats [%s] %llu msgs in %.1f ms | per msg: send_ioctl %.1f us, send_cmpl %.1f us, "
+                      "rx_post %.1f us | waits: recv %.1f us, credit %.1f us | notify %llu, kwait %llu | tx %.2f MiB rx %.2f MiB\n",
+            who, (unsigned long long)msgs, wall/1000.0,
+            double(st.post_us    - st_prev.post_us)    / d,
+            double(st.cmpl_us    - st_prev.cmpl_us)    / d,
+            double(st.rx_post_us - st_prev.rx_post_us) / d,
+            double(st.recv_us    - st_prev.recv_us)    / d,
+            double(st.ackw_us    - st_prev.ackw_us)    / d,
+            (unsigned long long)(st.n_notify - st_prev.n_notify),
+            (unsigned long long)(st.n_kwait  - st_prev.n_kwait),
+            double(st.bytes_tx - st_prev.bytes_tx)/1048576.0,
+            double(st.bytes_rx - st_prev.bytes_rx)/1048576.0);
+        st_prev = st;
+        st_t0   = now;
     }
 
     ~nd_conn() {
@@ -849,6 +918,7 @@ bool socket_t::impl::nd_setup(const struct sockaddr_in & local_addr) {
     }
     LOG_DBG("ND posted %d receives of %zu B each\n", ND_RX_DEPTH, ND_SLOT);
 
+    c->st_t0 = nd_now_us();
     nd = std::move(c);
     return true;
 }
@@ -1051,6 +1121,7 @@ bool socket_t::impl::nd_poll(ND2_RESULT * res) {
             continue;
         }
         if (!c->notify_armed) {
+            if (ND_STATS) { c->st.n_notify++; }
             HRESULT hr = c->cq->Notify(ND_CQ_NOTIFY_ANY, &c->ov_cq.ov);
             // ND_PENDING has success severity, so it must be tested before SUCCEEDED/FAILED
             if (hr == ND_PENDING) {
@@ -1071,6 +1142,7 @@ bool socket_t::impl::nd_poll(ND2_RESULT * res) {
         }
         // the provider cannot cancel a pending notify, so keep waiting on the same request
         // and only bound how long we sleep before checking whether the peer is still there
+        if (ND_STATS) { c->st.n_kwait++; }
         const DWORD w = WaitForSingleObject(c->ov_cq.ov.hEvent, ND_POLL_TICK_MS);
         if (w == WAIT_TIMEOUT) {
             if (tcp_peer_closed()) {
@@ -1140,14 +1212,21 @@ bool socket_t::impl::nd_post_send(size_t len) {
     sge.MemoryRegionToken = c->tx_token;
 
     c->send_done = 0;
+    const uint64_t t0 = ND_STATS ? nd_now_us() : 0;
     if (FAILED(c->qp->Send(ND_CTX_SEND, &sge, 1, 0))) {
         GGML_LOG_ERROR("ND Send post failed\n");
         return false;
     }
+    const uint64_t t1 = ND_STATS ? nd_now_us() : 0;
     while (c->send_done == 0) {
         if (!nd_step()) {
             return false;
         }
+    }
+    if (ND_STATS) {
+        c->st.post_us  += t1 - t0;
+        c->st.cmpl_us  += nd_now_us() - t1;
+        c->st.bytes_tx += len;
     }
     return true;
 }
@@ -1156,6 +1235,7 @@ bool socket_t::impl::nd_send_ack() {
     nd_conn * c = nd.get();
     const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_ACK, 0, c->tx_seq++ };
     memcpy(c->tx_buf, &hdr, sizeof(hdr));
+    if (ND_STATS) { c->st.n_ack++; }
     return nd_post_send(sizeof(hdr));
 }
 
@@ -1166,6 +1246,7 @@ bool socket_t::impl::nd_send_bye() {
     nd_conn * c = nd.get();
     const nd_msg_hdr hdr = { ND_MSG_MAGIC, ND_MSG_BYE, 0, c->tx_seq++ };
     memcpy(c->tx_buf, &hdr, sizeof(hdr));
+    if (ND_STATS) { c->st.n_ack++; }
     return nd_post_send(sizeof(hdr));
 }
 
@@ -1175,11 +1256,13 @@ bool socket_t::impl::nd_flush() {
         return true;
     }
     if (c->tx_since_ack >= ND_WINDOW) {
+        const uint64_t t0 = ND_STATS ? nd_now_us() : 0;
         while (c->ack_pending == 0) {
             if (!nd_step()) {
                 return false;
             }
         }
+        if (ND_STATS) { c->st.ackw_us += nd_now_us() - t0; }
         c->ack_pending--;
         c->tx_since_ack = 0;
     }
@@ -1187,10 +1270,14 @@ bool socket_t::impl::nd_flush() {
     memcpy(c->tx_buf, &hdr, sizeof(hdr));
     const size_t len = sizeof(hdr) + c->tx_fill;
     c->tx_fill = 0;
+    if (ND_STATS) { c->st.n_send++; }
     if (!nd_post_send(len)) {
         return false;
     }
     c->tx_since_ack++;
+    if (ND_STATS && (c->st.n_send + c->st.n_ack) - (c->st_prev.n_send + c->st_prev.n_ack) >= ND_STATS) {
+        c->dump_stats(is_server ? "server" : "client");
+    }
     return true;
 }
 
@@ -1224,6 +1311,7 @@ bool socket_t::impl::nd_recv(void * data, size_t size) {
     size_t rem = size;
     while (rem > 0) {
         uint32_t idle_steps = 0;
+        const uint64_t t0 = (ND_STATS && c->rx_ready.empty()) ? nd_now_us() : 0;
         while (c->rx_ready.empty()) {
             if (!nd_step()) {
                 return false;
@@ -1235,12 +1323,14 @@ bool socket_t::impl::nd_recv(void * data, size_t size) {
                 return false;
             }
         }
+        if (ND_STATS && t0) { c->st.recv_us += nd_now_us() - t0; }
         nd_rx_item & it = c->rx_ready.front();
         const size_t take = std::min((size_t)(it.len - it.off), rem);
         memcpy(dst, c->rx_slot(it.slot) + sizeof(nd_msg_hdr) + it.off, take);
         dst += take;
         rem -= take;
         it.off += (uint32_t)take;
+        if (ND_STATS) { c->st.bytes_rx += take; }
         if (it.off == it.len) {
             const int slot = it.slot;
             c->rx_ready.pop_front();

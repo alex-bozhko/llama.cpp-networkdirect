@@ -518,7 +518,6 @@ int cli_context::run() {
 
         // process commands
         if (string_starts_with(buffer, "/exit")) {
-            ggml_trace_write_html_default();
             break;
         } else if (string_starts_with(buffer, "/regen")) {
             if (impl->messages.size() >= 2) {
@@ -660,6 +659,9 @@ int cli_context::run() {
     }
 
     ui::show_message("\n\nExiting...");
+
+    // covers every exit path; the atexit fallback runs too late for stdio to be alive
+    ggml_trace_write_html_default();
 
     return 0;
 }

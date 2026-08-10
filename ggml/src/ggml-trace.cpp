@@ -105,6 +105,12 @@ struct trace_state {
     size_t bytes_in     = 0;
     size_t transfer_bytes = 0;
 
+    // single-token decode steps only, so prompt processing and warmup stay out of the average
+    int     cur_n_tokens  = 0;
+    int64_t ar_t_begin    = 0;
+    size_t  n_gen_steps   = 0;
+    int64_t gen_allreduce_us = 0;
+
     std::map<std::string, endpoint_totals> endpoints;
 
     int64_t t_start = 0;
@@ -348,6 +354,7 @@ void ggml_trace_step_begin(const char * label, int n_tokens) {
 
     g_trace.n_steps++;
     g_trace.in_step = true;
+    g_trace.cur_n_tokens = n_tokens;
 
     if (g_trace.steps.size() >= g_trace.max_steps) {
         g_trace.step_detail = false;
@@ -376,6 +383,9 @@ void ggml_trace_step_end(void) {
     if (s) {
         s->t_end = ggml_time_us();
     }
+    if (g_trace.cur_n_tokens == 1) {
+        g_trace.n_gen_steps++;
+    }
     g_trace.in_step = false;
 }
 
@@ -387,6 +397,8 @@ int ggml_trace_allreduce_begin(int subgraph, int n_devices, const char * name,
     std::lock_guard<std::mutex> lock(g_trace.mutex);
 
     g_trace.n_allreduce++;
+    // recorded unconditionally: the running average must survive the detail cap
+    g_trace.ar_t_begin = ggml_time_us();
 
     trace_step * s = cur_step();
     if (!s) {
@@ -400,7 +412,7 @@ int ggml_trace_allreduce_begin(int subgraph, int n_devices, const char * name,
     a.name      = name ? name : "";
     a.type      = type ? type : "";
     a.nbytes    = nbytes;
-    a.t_begin   = ggml_time_us();
+    a.t_begin   = g_trace.ar_t_begin;
     a.t_end     = a.t_begin;
     copy_ne(a.ne, ne);
 
@@ -421,12 +433,17 @@ void ggml_trace_allreduce_end(int id, const char * method) {
         g_trace.n_native++;
     }
 
+    const int64_t now = ggml_time_us();
+    if (g_trace.in_step && g_trace.cur_n_tokens == 1) {
+        g_trace.gen_allreduce_us += now - g_trace.ar_t_begin;
+    }
+
     trace_step * s = cur_step();
     if (!s || id < 0 || id >= (int) s->allreduces.size()) {
         return;
     }
     s->allreduces[id].method = method ? method : "?";
-    s->allreduces[id].t_end  = ggml_time_us();
+    s->allreduces[id].t_end  = now;
 }
 
 void ggml_trace_transfer(const char * phase, const char * src_name, const char * dst_name,
@@ -578,6 +595,10 @@ void ggml_trace_write_html(const char * path) {
         fprintf(f, "<div class=\"card\"><div class=\"k\">allreduce / step</div><div class=\"v\">%.1f</div></div>\n",
             double(g_trace.n_allreduce)/double(g_trace.n_steps));
     }
+    if (g_trace.n_gen_steps > 0) {
+        fprintf(f, "<div class=\"card\"><div class=\"k\">network ms / token</div><div class=\"v\">%.3f</div></div>\n",
+            double(g_trace.gen_allreduce_us)/1000.0/double(g_trace.n_gen_steps));
+    }
     fprintf(f, "</div>\n");
 
     fprintf(f, "<h2>Per endpoint</h2>\n<table><tr><th>endpoint</th><th>calls</th><th>sent</th><th>received</th><th>total</th></tr>\n");
@@ -610,6 +631,12 @@ void ggml_trace_write_html(const char * path) {
 
     fprintf(stderr, "ggml_trace: wrote %s (%zu decode steps, %zu allreduce, %zu butterfly, %zu RPC calls)\n",
         path, g_trace.n_steps, g_trace.n_allreduce, g_trace.n_butterfly, g_trace.n_rpc);
+
+    if (g_trace.n_gen_steps > 0) {
+        printf("ggml_trace: network %.3f ms/token (allreduce time over %zu single-token decode steps)\n",
+            double(g_trace.gen_allreduce_us)/1000.0/double(g_trace.n_gen_steps), g_trace.n_gen_steps);
+        fflush(stdout);
+    }
 }
 
 void ggml_trace_write_html_default(void) {
