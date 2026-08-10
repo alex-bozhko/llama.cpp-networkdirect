@@ -660,7 +660,8 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     // this is no-op because we don't have any async operations
 }
 
-static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited,
+                       const std::unordered_set<const ggml_tensor*> & nodes) {
     if (tensor == nullptr) {
         return;
     }
@@ -668,19 +669,34 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, 
         return;
     }
     visited.insert(tensor);
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        add_tensor(tensor->src[i], tensors, visited);
+    // the server only executes the nodes of the graph, so anything else is a leaf here: it needs
+    // the metadata but not the ops that produced it. stopping the recursion keeps a subgraph from
+    // dragging in the whole upstream tensor chain of the token.
+    const bool is_node = nodes.find(tensor) != nodes.end();
+    if (is_node) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            add_tensor(tensor->src[i], tensors, visited, nodes);
+        }
     }
-    add_tensor(tensor->view_src, tensors, visited);
-    tensors.push_back(serialize_tensor(tensor));
+    add_tensor(tensor->view_src, tensors, visited, nodes);
+    rpc_tensor serialized = serialize_tensor(tensor);
+    if (!is_node) {
+        memset(serialized.src, 0, sizeof(serialized.src));
+    }
+    tensors.push_back(serialized);
 }
 
 static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
     uint32_t n_nodes = cgraph->n_nodes;
     std::vector<rpc_tensor> tensors;
     std::unordered_set<ggml_tensor*> visited;
+    std::unordered_set<const ggml_tensor*> nodes;
+    nodes.reserve(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
-        add_tensor(cgraph->nodes[i], tensors, visited);
+        nodes.insert(cgraph->nodes[i]);
+    }
+    for (uint32_t i = 0; i < n_nodes; i++) {
+        add_tensor(cgraph->nodes[i], tensors, visited, nodes);
     }
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
