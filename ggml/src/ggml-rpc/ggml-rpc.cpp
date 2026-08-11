@@ -287,6 +287,7 @@ struct rpc_prof_cmd {
     uint64_t n_reply = 0;
     uint64_t bytes   = 0;
     uint64_t wait_us = 0;
+    uint64_t idle_us = 0;
 };
 
 static uint64_t rpc_prof_now_us() {
@@ -327,6 +328,63 @@ static void rpc_prof_wait(int cmd, uint64_t t0) {
     g_rpc_prof[cmd & 0xff].n_reply++;
 }
 
+// client side: time spent inside the send itself (staging + flush + send completion)
+static void rpc_prof_send(int cmd, uint64_t t0) {
+    if (!RPC_PROF) {
+        return;
+    }
+    g_rpc_prof[cmd & 0xff].idle_us += rpc_prof_now_us() - t0;
+}
+
+// splits serialized graphs into single-node allreduce helpers and real subgraphs
+static uint64_t g_rpc_g_aux_n = 0, g_rpc_g_aux_b = 0, g_rpc_g_aux_uid0 = 0;
+static uint64_t g_rpc_g_main_n = 0, g_rpc_g_main_b = 0, g_rpc_g_main_uid0 = 0;
+
+static void rpc_prof_graph(int n_nodes, uint64_t uid, size_t bytes) {
+    if (!RPC_PROF) {
+        return;
+    }
+    if (n_nodes == 1) {
+        g_rpc_g_aux_n++;
+        g_rpc_g_aux_b += bytes;
+        g_rpc_g_aux_uid0 += (uid == 0);
+    } else {
+        g_rpc_g_main_n++;
+        g_rpc_g_main_b += bytes;
+        g_rpc_g_main_uid0 += (uid == 0);
+    }
+}
+
+// splits the GET_TENSOR handler into the device-to-host copy and the reply send
+static uint64_t g_rpc_prof_d2h_us   = 0;
+static uint64_t g_rpc_prof_tx_us    = 0;
+static uint64_t g_rpc_prof_split_n  = 0;
+
+static void rpc_prof_split(uint64_t t0, uint64_t t1) {
+    if (!RPC_PROF) {
+        return;
+    }
+    g_rpc_prof_d2h_us += t1 - t0;
+    g_rpc_prof_tx_us  += rpc_prof_now_us() - t1;
+    g_rpc_prof_split_n++;
+}
+
+// server side: how long the serve loop waited for the next command byte, and how long the
+// handler then took (deserialization + compute + reply)
+static void rpc_prof_srv(int cmd, uint64_t t_idle0, uint64_t t_cmd0) {
+    if (!RPC_PROF) {
+        return;
+    }
+    const uint64_t t1 = rpc_prof_now_us();
+    g_rpc_prof[cmd & 0xff].idle_us += t_cmd0 - t_idle0;
+    g_rpc_prof[cmd & 0xff].wait_us += t1 - t_cmd0;
+    g_rpc_prof[cmd & 0xff].n++;
+    if (++g_rpc_prof_n >= RPC_PROF) {
+        rpc_prof_dump();
+        g_rpc_prof_n = 0;
+    }
+}
+
 static void rpc_prof_dump() {
     static const char * names[RPC_CMD_COUNT] = {
         "ALLOC_BUFFER", "GET_ALIGNMENT", "GET_MAX_SIZE", "BUFFER_GET_BASE", "FREE_BUFFER",
@@ -348,10 +406,31 @@ static void rpc_prof_dump() {
         }
         const uint64_t b = g_rpc_prof[i].bytes   - g_rpc_prof_prev[i].bytes;
         const uint64_t w = g_rpc_prof[i].wait_us - g_rpc_prof_prev[i].wait_us;
-        fprintf(stderr, "  %-18s n=%-7llu req=%-8.0f B  reply_wait=%-8.1f us  total_wait=%.1f ms\n",
+        const uint64_t d = g_rpc_prof[i].idle_us - g_rpc_prof_prev[i].idle_us;
+        fprintf(stderr, "  %-18s n=%-7llu req=%-8.0f B  reply_wait=%-8.1f us  total_wait=%.1f ms  idle=%.1f us\n",
                 names[i], (unsigned long long)n, double(b)/double(n), n ? double(w)/double(n) : 0.0,
-                double(w)/1000.0);
+                double(w)/1000.0, n ? double(d)/double(n) : 0.0);
         g_rpc_prof_prev[i] = g_rpc_prof[i];
+    }
+    if (g_rpc_prof_split_n) {
+        fprintf(stderr, "  GET_TENSOR split: d2h %.1f us, reply send %.1f us over %llu calls\n",
+                double(g_rpc_prof_d2h_us)/double(g_rpc_prof_split_n),
+                double(g_rpc_prof_tx_us)/double(g_rpc_prof_split_n),
+                (unsigned long long)g_rpc_prof_split_n);
+        g_rpc_prof_d2h_us  = 0;
+        g_rpc_prof_tx_us   = 0;
+        g_rpc_prof_split_n = 0;
+    }
+    if (g_rpc_g_aux_n || g_rpc_g_main_n) {
+        fprintf(stderr, "  graphs: aux(1 node) n=%llu avg=%.0f B uid0=%llu | main n=%llu avg=%.0f B uid0=%llu\n",
+                (unsigned long long)g_rpc_g_aux_n,
+                g_rpc_g_aux_n ? double(g_rpc_g_aux_b)/double(g_rpc_g_aux_n) : 0.0,
+                (unsigned long long)g_rpc_g_aux_uid0,
+                (unsigned long long)g_rpc_g_main_n,
+                g_rpc_g_main_n ? double(g_rpc_g_main_b)/double(g_rpc_g_main_n) : 0.0,
+                (unsigned long long)g_rpc_g_main_uid0);
+        g_rpc_g_aux_n = g_rpc_g_aux_b = g_rpc_g_aux_uid0 = 0;
+        g_rpc_g_main_n = g_rpc_g_main_b = g_rpc_g_main_uid0 = 0;
     }
     fflush(stderr);
     g_rpc_prof_t0 = now;
@@ -374,12 +453,14 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
+    const uint64_t t0 = rpc_prof_now_us();
     sock->cork();
     const bool ok = sock->send_data(&cmd_byte, sizeof(cmd_byte))
                  && sock->send_data(&input_size, sizeof(input_size))
                  && sock->send_data(input, input_size);
     const bool flushed = sock->uncork();
     rpc_prof_add(cmd, false, input_size);
+    rpc_prof_send(cmd, t0);
     return ok && flushed;
 }
 
@@ -821,6 +902,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
+        rpc_prof_graph(cgraph->n_nodes, cgraph->uid, input.size());
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         RPC_STATUS_ASSERT(status);
@@ -1575,9 +1657,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     while (true) {
+        const uint64_t t_idle0 = rpc_prof_now_us();
         if (!sock->recv_data(&cmd, 1)) {
             break;
         }
+        const uint64_t t_cmd0 = rpc_prof_now_us();
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
@@ -1738,12 +1822,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 std::vector<uint8_t> response;
+                const uint64_t t_get0 = rpc_prof_now_us();
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
+                const uint64_t t_get1 = rpc_prof_now_us();
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
                 }
+                rpc_prof_split(t_get0, t_get1);
                 break;
             }
             case RPC_CMD_COPY_TENSOR: {
@@ -1799,6 +1886,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 return;
             }
         }
+        rpc_prof_srv(cmd, t_idle0, t_cmd0);
     }
 }
 
