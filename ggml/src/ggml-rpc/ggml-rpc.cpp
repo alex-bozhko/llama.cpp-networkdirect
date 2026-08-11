@@ -863,13 +863,16 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
         add_tensor(cgraph->nodes[i], tensors, visited, nodes);
     }
     // serialization format:
-    // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+    // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     uint32_t n_tensors = tensors.size();
-    int output_size = 2*sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+    const uint64_t uid = cgraph->uid;
+    int output_size = 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
     output.resize(output_size, 0);
     uint8_t * dest = output.data();
     memcpy(dest, &device, sizeof(device));
     dest += sizeof(device);
+    memcpy(dest, &uid, sizeof(uid));
+    dest += sizeof(uid);
     memcpy(dest, &n_nodes, sizeof(n_nodes));
     dest += sizeof(n_nodes);
     for (uint32_t i = 0; i < n_nodes; i++) {
@@ -899,7 +902,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         ggml_trace_rpc(rpc_ctx->endpoint.c_str(), (int) rpc_ctx->device, "GRAPH_RECOMPUTE",
             cgraph->nodes[cgraph->n_nodes - 1]->name, graph_ne, sizeof(request), 0);
     } else {
-        rpc_dev_ctx->last_graph_uid = cgraph->uid;
+        // a graph without a uid cannot be replayed, and must not evict the one that can
+        if (cgraph->uid != 0) {
+            rpc_dev_ctx->last_graph_uid = cgraph->uid;
+        }
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         rpc_prof_graph(cgraph->n_nodes, cgraph->uid, input.size());
@@ -1036,6 +1042,10 @@ public:
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
+        // graphs that carry no uid can never be replayed, so they get their own scratch
+        // buffer and must not overwrite the one holding a replayable graph
+        std::vector<uint8_t>   scratch;
+        ggml_context_ptr       ctx;
     };
 
 private:
@@ -1525,10 +1535,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     if (device >= backends.size()) {
         return false;
     }
+    uint64_t uid;
+    memcpy(&uid, src, sizeof(uid));
+    src += sizeof(uid);
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
-    if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
+    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t)) {
         return false;
     }
     const uint64_t * nodes = (const uint64_t *)src;
@@ -1536,19 +1549,26 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     uint32_t n_tensors;
     memcpy(&n_tensors, src, sizeof(n_tensors));
     src += sizeof(n_tensors);
-    if (input.size() < 2*sizeof(uint32_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
+    if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t) + n_nodes*sizeof(uint64_t) + sizeof(uint32_t) + n_tensors*sizeof(rpc_tensor)) {
         return false;
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
 
+    const bool replayable = uid != 0;
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
-    if (stored_graphs[device].buffer.size() < buf_size) {
-        stored_graphs[device].buffer.resize(buf_size);
+    if (replayable) {
+        // release the previous occupant before its backing memory is resized or reused
+        stored_graphs[device].graph = nullptr;
+        stored_graphs[device].ctx.reset();
+    }
+    std::vector<uint8_t> & mem = replayable ? stored_graphs[device].buffer : stored_graphs[device].scratch;
+    if (mem.size() < buf_size) {
+        mem.resize(buf_size);
     }
     struct ggml_init_params params = {
         /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ stored_graphs[device].buffer.data(),
+        /*.mem_buffer =*/ mem.data(),
         /*.no_alloc   =*/ true,
     };
     ggml_context_ptr ctx_ptr { ggml_init(params) };
@@ -1578,7 +1598,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    stored_graphs[device].graph = graph;
+    if (replayable) {
+        // the graph lives in stored_graphs[device].buffer, so the context that owns its
+        // tensors has to outlive this call for a later recompute to be able to replay it
+        stored_graphs[device].graph = graph;
+        stored_graphs[device].ctx   = std::move(ctx_ptr);
+    }
     return true;
 }
 
