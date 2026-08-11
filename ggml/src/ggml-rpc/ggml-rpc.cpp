@@ -246,10 +246,11 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len) {
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
-    if (!sock->send_data(&msg_size, sizeof(msg_size))) {
-        return false;
-    }
-    return sock->send_data(msg, msg_size);
+    sock->cork();
+    const bool ok = sock->send_data(&msg_size, sizeof(msg_size))
+                 && sock->send_data(msg, msg_size);
+    const bool flushed = sock->uncork();
+    return ok && flushed;
 }
 
 static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
