@@ -265,6 +265,9 @@ struct nd_conn {
     struct sockaddr_in peer  = {};
 
     std::deque<nd_rx_item> rx_ready;
+    // slots whose payload has been consumed but whose Receive has not been re-posted yet;
+    // posting costs ~150 us on this provider, so it is kept off the reply path
+    std::vector<int> rx_repost;
     bool     connected    = false;
     bool     peer_gone    = false;
     bool     notify_armed = false;
@@ -420,6 +423,7 @@ struct socket_t::impl {
     bool nd_step();
     bool nd_post_send(size_t len);
     bool nd_flush();
+    bool nd_repost_rx();
     bool nd_send_ack();
     bool nd_send_bye();
     bool nd_send(const void * data, size_t size);
@@ -1302,6 +1306,18 @@ bool socket_t::impl::nd_send(const void * data, size_t size) {
     return true;
 }
 
+bool socket_t::impl::nd_repost_rx() {
+    nd_conn * c = nd.get();
+    while (!c->rx_repost.empty()) {
+        const int slot = c->rx_repost.back();
+        c->rx_repost.pop_back();
+        if (!c->post_rx(slot)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool socket_t::impl::nd_recv(void * data, size_t size) {
     nd_conn * c = nd.get();
     // a staged request has to reach the peer before we block waiting for its reply
@@ -1311,6 +1327,10 @@ bool socket_t::impl::nd_recv(void * data, size_t size) {
     uint8_t * dst = (uint8_t *)data;
     size_t rem = size;
     while (rem > 0) {
+        // never block without handing the peer its buffers back first
+        if (c->rx_ready.empty() && !nd_repost_rx()) {
+            return false;
+        }
         uint32_t idle_steps = 0;
         const uint64_t t0 = (ND_STATS && c->rx_ready.empty()) ? nd_now_us() : 0;
         while (c->rx_ready.empty()) {
@@ -1335,11 +1355,13 @@ bool socket_t::impl::nd_recv(void * data, size_t size) {
         if (it.off == it.len) {
             const int slot = it.slot;
             c->rx_ready.pop_front();
-            if (!c->post_rx(slot)) {
-                return false;
-            }
+            c->rx_repost.push_back(slot);
             if (++c->rx_since_ack >= ND_WINDOW) {
                 c->rx_since_ack = 0;
+                // the ack hands credit back, so the buffers must be posted before it goes out
+                if (!nd_repost_rx()) {
+                    return false;
+                }
                 if (!nd_send_ack()) {
                     return false;
                 }
