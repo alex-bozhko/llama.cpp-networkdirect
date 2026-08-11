@@ -6,6 +6,7 @@
 #include "transport.h"
 
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -276,8 +277,86 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
     return sock->recv_data(input.data(), size);
 }
 
-static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
+// per-command client profiler, enabled with GGML_RPC_PROF=<reports every N commands>
+static const char *  RPC_PROF_ENV = std::getenv("GGML_RPC_PROF");
+static const uint64_t RPC_PROF    = RPC_PROF_ENV ? strtoull(RPC_PROF_ENV, nullptr, 10) : 0;
+
+struct rpc_prof_cmd {
+    uint64_t n       = 0;
+    uint64_t n_reply = 0;
+    uint64_t bytes   = 0;
+    uint64_t wait_us = 0;
+};
+
+static uint64_t rpc_prof_now_us() {
+    if (!RPC_PROF) {
+        return 0;
+    }
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static rpc_prof_cmd   g_rpc_prof[256];
+static rpc_prof_cmd   g_rpc_prof_prev[256];
+static uint64_t       g_rpc_prof_n  = 0;
+static uint64_t       g_rpc_prof_t0 = 0;
+
+static void rpc_prof_dump();
+
+static void rpc_prof_add(int cmd, bool reply, size_t bytes) {
+    if (!RPC_PROF) {
+        return;
+    }
+    g_rpc_prof[cmd & 0xff].n++;
+    g_rpc_prof[cmd & 0xff].bytes += bytes;
+    if (reply) {
+        g_rpc_prof[cmd & 0xff].n_reply++;
+    }
+    if (++g_rpc_prof_n >= RPC_PROF) {
+        rpc_prof_dump();
+        g_rpc_prof_n = 0;
+    }
+}
+
+static void rpc_prof_wait(int cmd, uint64_t t0) {
+    if (!RPC_PROF) {
+        return;
+    }
+    g_rpc_prof[cmd & 0xff].wait_us += rpc_prof_now_us() - t0;
+    g_rpc_prof[cmd & 0xff].n_reply++;
+}
+
+static void rpc_prof_dump() {
+    static const char * names[RPC_CMD_COUNT] = {
+        "ALLOC_BUFFER", "GET_ALIGNMENT", "GET_MAX_SIZE", "BUFFER_GET_BASE", "FREE_BUFFER",
+        "BUFFER_CLEAR", "SET_TENSOR", "SET_TENSOR_HASH", "GET_TENSOR", "COPY_TENSOR",
+        "GRAPH_COMPUTE", "GET_DEVICE_MEMORY", "INIT_TENSOR", "GET_ALLOC_SIZE", "HELLO",
+        "DEVICE_COUNT", "GRAPH_RECOMPUTE",
+    };
+    const uint64_t now = rpc_prof_now_us();
+    if (g_rpc_prof_t0 == 0) {
+        g_rpc_prof_t0 = now;
+        for (int i = 0; i < RPC_CMD_COUNT; i++) { g_rpc_prof_prev[i] = g_rpc_prof[i]; }
+        return;
+    }
+    fprintf(stderr, "RPC prof window %.1f ms\n", double(now - g_rpc_prof_t0)/1000.0);
+    for (int i = 0; i < RPC_CMD_COUNT; i++) {
+        const uint64_t n = g_rpc_prof[i].n - g_rpc_prof_prev[i].n;
+        if (n == 0) {
+            continue;
+        }
+        const uint64_t b = g_rpc_prof[i].bytes   - g_rpc_prof_prev[i].bytes;
+        const uint64_t w = g_rpc_prof[i].wait_us - g_rpc_prof_prev[i].wait_us;
+        fprintf(stderr, "  %-18s n=%-7llu req=%-8.0f B  reply_wait=%-8.1f us  total_wait=%.1f ms\n",
+                names[i], (unsigned long long)n, double(b)/double(n), n ? double(w)/double(n) : 0.0,
+                double(w)/1000.0);
+        g_rpc_prof_prev[i] = g_rpc_prof[i];
+    }
+    fflush(stderr);
+    g_rpc_prof_t0 = now;
+}
+
+static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {    size_t pos = endpoint.find(':');
     if (pos == std::string::npos) {
         return false;
     }
@@ -299,6 +378,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
                  && sock->send_data(&input_size, sizeof(input_size))
                  && sock->send_data(input, input_size);
     const bool flushed = sock->uncork();
+    rpc_prof_add(cmd, false, input_size);
     return ok && flushed;
 }
 
@@ -308,6 +388,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    const uint64_t t0 = rpc_prof_now_us();
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -318,6 +399,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->recv_data(output, output_size)) {
         return false;
     }
+    rpc_prof_wait(cmd, t0);
     return true;
 }
 

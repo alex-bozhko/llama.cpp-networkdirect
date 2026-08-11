@@ -311,8 +311,8 @@ struct nd_conn {
         }
         const double wall = double(now - st_t0);
         const double d    = double(msgs);
-        GGML_LOG_INFO("ND stats [%s] %llu msgs in %.1f ms | per msg: send_ioctl %.1f us, send_cmpl %.1f us, "
-                      "rx_post %.1f us | waits: recv %.1f us, credit %.1f us | notify %llu, kwait %llu | tx %.2f MiB rx %.2f MiB\n",
+        fprintf(stderr, "ND stats [%s] %llu msgs in %.1f ms | per msg: send_ioctl %.1f us, send_cmpl %.1f us, "
+                        "rx_post %.1f us | waits: recv %.1f us, credit %.1f us | notify %llu, kwait %llu | tx %.2f MiB rx %.2f MiB\n",
             who, (unsigned long long)msgs, wall/1000.0,
             double(st.post_us    - st_prev.post_us)    / d,
             double(st.cmpl_us    - st_prev.cmpl_us)    / d,
@@ -323,6 +323,7 @@ struct nd_conn {
             (unsigned long long)(st.n_kwait  - st_prev.n_kwait),
             double(st.bytes_tx - st_prev.bytes_tx)/1048576.0,
             double(st.bytes_rx - st_prev.bytes_rx)/1048576.0);
+        fflush(stderr);
         st_prev = st;
         st_t0   = now;
     }
