@@ -152,7 +152,7 @@ static constexpr uint32_t ND_POLL_TICK_MS = 200;   // how long to sleep on the C
 static constexpr uint32_t ND_REAP_MS      = 200;   // bounded reap of a pending CQ notify during teardown
 static constexpr uint32_t ND_MAX_EMPTY_NOTIFY = 64;      // CQ claims ready but yields nothing this many times
 static constexpr uint32_t ND_MAX_IDLE_STEPS   = 100000;  // completions consumed while no payload arrives
-static constexpr uint16_t ND_CM_PORT    = 23517;   // fixed by the provider's connection manager
+static constexpr uint16_t ND_CM_PORT    = 23517;   // TCP port for ND connection management
 
 enum nd_msg_type : uint32_t {
     ND_MSG_DATA = 1,
@@ -975,18 +975,16 @@ bool socket_t::impl::nd_setup_any(struct sockaddr_in * chosen) {
 
 bool socket_t::impl::nd_listen() {
     nd_conn * c = nd.get();
+    struct sockaddr_in listen_addr = c->local;
+    listen_addr.sin_port = htons(ND_CM_PORT);
 
-    // the provider binds the CM port with SO_REUSEADDR, so a second server on this host would
-    // bind it again and inbound connections would be split between the two listeners at random.
-    // a plain bind without SO_REUSEADDR is rejected while another listener holds the port.
+    // Probe the CM port to prevent duplicate listeners with providers that allow address reuse.
     {
         sockfd_t probe = socket(AF_INET, SOCK_STREAM, 0);
         if (probe == INVALID_SOCKET) {
             return false;
         }
-        struct sockaddr_in probe_addr = c->local;
-        probe_addr.sin_port = htons(ND_CM_PORT);
-        const bool taken = bind(probe, (const struct sockaddr *)&probe_addr, sizeof(probe_addr)) != 0;
+        const bool taken = bind(probe, (const struct sockaddr *)&listen_addr, sizeof(listen_addr)) != 0;
         closesocket(probe);
         if (taken) {
             LOG_DBG("ND CM port %u already in use on this host, staying on TCP\n", ND_CM_PORT);
@@ -999,7 +997,7 @@ bool socket_t::impl::nd_listen() {
         LOG_DBG("ND CreateListener failed: 0x%08lx\n", (unsigned long)hr);
         return false;
     }
-    hr = c->listener->Bind((const struct sockaddr *)&c->local, sizeof(c->local));
+    hr = c->listener->Bind((const struct sockaddr *)&listen_addr, sizeof(listen_addr));
     if (FAILED(hr)) {
         LOG_DBG("ND listener Bind failed: 0x%08lx\n", (unsigned long)hr);
         return false;
@@ -1009,7 +1007,7 @@ bool socket_t::impl::nd_listen() {
         LOG_DBG("ND Listen failed: 0x%08lx\n", (unsigned long)hr);
         return false;
     }
-    LOG_DBG("ND listening on %s (CM port %u)\n", nd_addr_str(c->local).s, ND_CM_PORT);
+    LOG_DBG("ND listening on %s (CM port %u)\n", nd_addr_str(listen_addr).s, ND_CM_PORT);
     return true;
 }
 
@@ -1066,6 +1064,7 @@ bool socket_t::impl::nd_connect(const struct sockaddr_in & peer_addr) {
 
     nd_conn * c = nd.get();
     c->peer = peer_addr;
+    c->peer.sin_port = htons(ND_CM_PORT);
 
     hr = c->connector->Bind((const struct sockaddr *)&c->local, sizeof(c->local));
     if (FAILED(hr)) {

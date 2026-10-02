@@ -113,7 +113,9 @@ Like RDMA, the transport is negotiated during the HELLO handshake and needs no c
 
 The TCP connection is also used to pick the local adapter. When RDMA and TCP run over different NICs, set `GGML_ND_ADDR` on both peers to the IPv4 address of the RDMA NIC.
 
-Note that the reference provider uses a fixed connection-management port, so only one NetworkDirect-enabled `ggml-rpc-server` can serve a client per host at a time. Further servers detect that the port is taken and fall back to TCP.
+This transport explicitly uses TCP port `23517` for NetworkDirect connection management: the server binds its ND listener to this port and the client connects to it. This is separate from the RPC TCP port selected by `--port` (default `50052`); the client's local ND bind port remains `0` for automatic allocation. It does not rely on the provider substituting a default port.
+
+Only one NetworkDirect listener can use a given local IP address and port `23517` at a time. Further servers using the same address detect that the port is taken and fall back to TCP.
 
 Set `GGML_RPC_DEBUG=1` on both peers to trace the NetworkDirect bring-up: adapter selection and capabilities, memory registration, completion queue and queue pair creation, and each stage of the connection handshake. Every step that can decline to TCP reports why.
 
@@ -123,4 +125,3 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggm
 ```bash
 $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
 ```
-
