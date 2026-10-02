@@ -195,6 +195,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q6_K:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
@@ -214,6 +215,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     case GGML_TYPE_Q4_K:
                     case GGML_TYPE_Q6_K:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
@@ -1648,12 +1650,14 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
     static ggml_backend_buffer_type ggml_backend_cpu_buffer_type_riscv64_spacemit = {
   /* .iface    = */
         {
-         /* .get_name         = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name,
-         /* .alloc_buffer     = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_alloc_buffer,
-         /* .get_alignment    = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_alignment,
-         /* .get_max_size     = */ nullptr,
-         /* .get_alloc_size   = */ ggml_backend_cpu_riscv64_spacemit_nbytes,
-         /* .is_host          = */ nullptr,
+         /* .get_name           = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_name,
+         /* .alloc_buffer       = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_alloc_buffer,
+         /* .alloc_buffer_n     = */ NULL,
+         /* .get_alignment      = */ ggml_backend_cpu_riscv64_spacemit_buffer_type_get_alignment,
+         /* .get_max_size       = */ nullptr,
+         /* .get_alloc_size     = */ ggml_backend_cpu_riscv64_spacemit_nbytes,
+         /* .get_alloc_size_n   = */ NULL,
+         /* .is_host            = */ nullptr,
          },
  /* .device  = */
         ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),

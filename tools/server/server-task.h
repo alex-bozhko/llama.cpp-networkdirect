@@ -11,17 +11,18 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
-using json = nlohmann::ordered_json;
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
+    SERVER_TASK_TYPE_DECISION,
     SERVER_TASK_TYPE_INFILL,
     SERVER_TASK_TYPE_CANCEL,
     SERVER_TASK_TYPE_CONTROL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
+    SERVER_TASK_TYPE_SLOT_GET,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -148,6 +149,8 @@ struct server_task {
     // temporary store of child tasks for scheduling
     // note: accessing to elements is invalid after the task is moved to server_slot
     std::vector<server_task> child_tasks;
+    // if set on a parent, the children have their own prompt and only share its first n_tokens_shared tokens
+    int32_t n_tokens_shared = 0;
 
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
@@ -172,6 +175,26 @@ struct server_task {
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
 
+    // used by SERVER_TASK_TYPE_DECISION
+    // where to read the model output of each option, exactly one of the two lists is used
+    struct decision {
+        std::vector<llama_token> labels;  // logits of these tokens, at the last prompt token
+        std::vector<int32_t>     markers; // embeddings[column] at these prompt positions
+        int32_t                  column = 0;
+        // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
+        int32_t                  pointer = -1;
+
+        // first prompt position that is read, -1 if none
+        int32_t pos_first() const {
+            int32_t pos = pointer;
+            for (const int32_t marker : markers) {
+                pos = pos < 0 ? marker : std::min(pos, marker);
+            }
+            return pos;
+        }
+    };
+    decision decision;
+
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
@@ -188,6 +211,8 @@ struct server_task {
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
                 return true;
+            case SERVER_TASK_TYPE_DECISION:
+                return !decision.markers.empty();
             default:
                 return false;
         }
@@ -198,6 +223,8 @@ struct server_task {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
                 return true;
+            case SERVER_TASK_TYPE_DECISION:
+                return !decision.labels.empty();
             default:
                 return false;
         }
@@ -257,26 +284,6 @@ struct server_task {
     bool is_child() const {
         return id_parent != -1;
     }
-};
-
-struct result_timings {
-    int32_t cache_n = -1;
-
-    int32_t prompt_n = -1;
-    double prompt_ms = 0.0;
-    double prompt_per_token_ms = 0.0;
-    double prompt_per_second = 0.0;
-
-    int32_t predicted_n = -1;
-    double predicted_ms = 0.0;
-    double predicted_per_token_ms = 0.0;
-    double predicted_per_second = 0.0;
-
-    // Optional speculative metrics - only included when > 0
-    int32_t draft_n = 0;
-    int32_t draft_n_accepted = 0;
-
-    json to_json() const;
 };
 
 struct result_prompt_progress {
@@ -343,7 +350,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool stream;
     bool include_usage;
-    result_timings timings;
+    server_slot_stats stats;
     std::string prompt;
 
     bool truncated;
@@ -425,7 +432,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
-    result_timings timings;
+    server_slot_stats stats;
     result_prompt_progress progress;
 
     // response formatting
@@ -494,6 +501,14 @@ struct server_task_result_rerank : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_task_result_decision : server_task_result {
+    std::vector<float> scores; // one raw model output per option
+
+    int32_t n_tokens;
+
+    virtual json to_json() override;
+};
+
 struct server_task_result_error : server_task_result {
     error_type err_type = ERROR_TYPE_SERVER;
     std::string err_msg;
@@ -509,28 +524,27 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
+// used by /metrics API
 struct server_task_result_metrics : server_task_result {
-    int n_idle_slots;
-    int n_processing_slots;
-    int n_tasks_deferred;
-    int64_t t_start;
+    // these are immediate stats, not accumulated (server_metrics is cumulative)
+    int n_processing_slots = 0;
+    int n_tasks_deferred = 0;
 
-    // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
-    uint64_t n_prompt_tokens_processed_total = 0;
-    uint64_t t_prompt_processing_total       = 0;
-    uint64_t n_tokens_predicted_total        = 0;
-    uint64_t t_tokens_generation_total       = 0;
+    server_metrics metrics;
 
-    uint64_t n_tokens_max = 0;
+    virtual json to_json() override;
 
-    uint64_t n_prompt_tokens_processed = 0;
-    uint64_t t_prompt_processing       = 0;
+    struct metric_item {
+        std::string name;
+        std::string description;
+        double value; // prometheus values are always float64
+    };
+    std::string to_metrics();
+};
 
-    uint64_t n_tokens_predicted  = 0;
-    uint64_t t_tokens_generation = 0;
-
-    uint64_t n_decode_total     = 0;
-    uint64_t n_busy_slots_total = 0;
+// used by /slots API
+struct server_task_result_slots : server_task_result {
+    int n_idle_slots = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
@@ -650,7 +664,7 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
 };
